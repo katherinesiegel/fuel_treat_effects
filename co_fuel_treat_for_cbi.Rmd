@@ -1,0 +1,325 @@
+---
+title: "fs_fuel_treatment"
+author: "Katherine Siegel"
+date: "August 23, 2023"
+output: html_document
+---
+
+## Set up
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+### Load packages
+library(tidyverse)
+library(sf)
+library(lubridate)
+library(raster)
+library(terra)
+```
+
+## Key notes and next steps
+There are some points that burned in multiple wildfires, and I don't know which one is actually relevant. This means that some sample points currently have more than 1 row, but because of the way I extracted the data, the composite burn index values are the same for both rows (because I just extracted the top layer's burn index value). The multiple overlapping fires also means there are NAs in fire_samples that shouldn't actually be there -- when I merged the rasters, the code created NA values in the unburned rectangles around the fires.
+
+Next steps: figure out which fires actually matter for the control and treated points, re-do raster merge to make sure I'm including the correct fires for each sample point and not getting the NA pixels. Then extract the burn severity data to the dataset again.
+
+## Get fires that overlapped with fuel treatments
+```{r}
+### Open fuel treatment database
+ft <- st_read("E:/mtbs_rxfire_intersections/mtbs_rxfire_intersect_olddef.shp") 
+
+### how many unique fires are there in ft?
+length(unique(ft$Event_ID)) ## 72
+
+### subset all fires to ft
+mtbs <- st_read("E:/fire_sev_rdd/mtbs/mtbs_perims_DD.shp") %>%
+  filter(., Event_ID %in% ft$Event_ID) %>%
+  st_transform(crs = 5070)
+
+### check for types of fires included here
+table(mtbs$Incid_Type)
+## 11 prescribed
+### 3 unknown
+### 57 wildfire
+### 1 wildland fire use
+
+### leaving all fire types in for now, but seems like we should restrict moving forward.
+```
+### export fire perimeters for CBI analysis
+- Fire_ID
+- Fire_Year
+- Start_Day (start day of fire season in Julian days)
+- End_Day (end day of fire season in Julian days)
+```{r}
+### add date cols
+mtbs <- mtbs %>%
+  tidyr::separate(Ig_Date, c('year', 'month', 'day'), 
+                  sep = "-",
+                  remove = FALSE) %>%
+  mutate_at(c('year', 'month', 'day'), as.numeric)
+
+### reduce cols
+mtbs_gee <- mtbs %>%
+  dplyr::select(Event_ID,
+                Incid_Type,
+                Ig_Date, 
+                date = day,
+                month, 
+                year,
+                geometry)
+
+# ### Group by state and see earliest date of ignition
+# ig_earlies <- recent_fires_gee
+# ig_earlies$geometry <- NULL
+# ig_earlies <- ig_earlies %>%
+#   group_by(year) %>%
+#   summarise(earliest_ig_month = min(month),
+#             latest_ig_month = max(month))
+
+### Fire seasons
+#### In Parks et al. 2019, they use the following seasons:
+#### AZ and NM: April 1-June 30 (julian 91-181)
+#### CA, ID, MT, OR, UT, WA, WY: June 1-Sept 15 (julian 152-258)
+#### use these
+# other_julian <- c("CA", "CO", "ID",
+#                   "MT", "NV", "OR",
+#                   "SD", "TX",
+#                   "UT", "WA", "WY")
+
+### use julian fire season dates for CA, ID, MT, OR, UT, WA, WY
+
+### assign julian start and end date based on state dates from Parks et al. 2019
+mtbs_gee <- mtbs_gee %>%
+  mutate(Start_Day = 152,
+         End_Day = 258)
+
+### Select columns for GEE
+mtbs_gee <- mtbs_gee %>%
+  dplyr::select(Fire_ID = Event_ID,
+                Fire_Year = year,
+                Start_Day,
+                End_Day,
+                Incid_Type,
+                geometry)
+
+### Make sure date columns don't get read in with decimals
+mtbs_gee$Fire_Year <- as.character(mtbs_gee$Fire_Year, 0)
+mtbs_gee$Start_Day <- as.character(mtbs_gee$Start_Day, 0)
+mtbs_gee$End_Day <- as.character(mtbs_gee$End_Day, 0)
+
+### Write out shp for gee
+st_write(mtbs_gee,
+         "C:/Users/kjsie/Documents/Dee Lab/USDA AFRI 2023/co_mtbs_gee.shp")
+```
+
+## CBI for control points
+```{r}
+### all fires
+mtbs <- st_read("E:/fire_sev_rdd/mtbs/mtbs_perims_DD.shp") %>%
+  st_transform(crs = 5070)
+
+### open data
+sample_pts <- st_read("C:/Users/kjsie/Documents/Dee Lab/USDA AFRI 2023/USDA_sample_points/samplepoints500_co_fs.shp") %>%
+  st_transform(crs = 5070) %>%
+  
+  ### add unique identification column
+  mutate(uid = 1:nrow(sample_pts))
+
+### by state
+mtbs <- mtbs %>%
+  mutate(state = stringr::str_extract(Event_ID, "^.{2}"))
+
+### filter to CO and surrounding states
+mtbs_co <- mtbs %>%
+  filter(state %in% c("CO", "UT", "AZ", "NM", 
+                      "WY", "OK", "KS", "NE"))
+
+### reduce cols
+mtbs_co <- mtbs_co %>%
+  dplyr::select(Event_ID, Incid_Type, geometry)
+
+### intersect with points
+sample_fires <- st_intersection(sample_pts,
+                                mtbs_co)
+
+### new fire perimeters that I need
+control_mtbs <- mtbs_co %>%
+  
+  ### fires in the sample
+  filter(Event_ID %in% sample_fires$Event_ID) %>%
+  
+  ### drop fires I already did
+  filter(!Event_ID %in% ft$Event_ID)
+
+```
+#### points in multiple fires?
+```{r}
+check <- sample_fires
+st_geometry(check) <- NULL
+check <- check %>%
+  group_by(uid) %>%
+  summarise(n_fires = n())
+check <- check %>%
+  filter(n_fires > 1)
+
+### what do these look like?
+check_fires <- sample_fires %>%
+  filter(uid %in% check$uid)
+
+### what do they look like in Anna's sample pts?
+check_pts <- sample_pts %>%
+  filter(uid %in% check$uid)
+```
+
+### export fire perimeters for CBI analysis
+- Fire_ID
+- Fire_Year
+- Start_Day (start day of fire season in Julian days)
+- End_Day (end day of fire season in Julian days)
+```{r}
+### get full data for mtbs from control pts
+mtbs_control <- mtbs %>%
+  filter(Event_ID %in% control_mtbs$Event_ID)
+  
+### add date cols
+mtbs_control <- mtbs_control %>%
+  tidyr::separate(Ig_Date, c('year', 'month', 'day'), 
+                  sep = "-",
+                  remove = FALSE) %>%
+  mutate_at(c('year', 'month', 'day'), as.numeric)
+
+### reduce cols
+mtbs_control <- mtbs_control %>%
+  dplyr::select(Event_ID,
+                Incid_Type,
+                Ig_Date, 
+                date = day,
+                month, 
+                year,
+                geometry)
+
+### add state
+mtbs_control <- mtbs_control %>%
+  mutate(state = stringr::str_extract(Event_ID, "^.{2}"))
+
+### Fire seasons
+#### In Parks et al. 2019, they use the following seasons:
+#### AZ and NM: April 1-June 30 (julian 91-181)
+#### CA, ID, MT, OR, UT, WA, WY: June 1-Sept 15 (julian 152-258)
+#### use these
+# other_julian <- c("CA", "CO", "ID",
+#                   "MT", "NV", "OR",
+#                   "SD", "TX",
+#                   "UT", "WA", "WY")
+
+### use julian fire season dates for CA, ID, MT, OR, UT, WA, WY
+
+### assign julian start and end date based on state dates from Parks et al. 2019
+mtbs_control <- mtbs_control %>%
+  mutate(Start_Day = ifelse(state == "NM", 91, 152),
+         End_Day = ifelse(state == "NM", 181, 258))
+
+### Select columns for GEE
+mtbs_control <- mtbs_control %>%
+  dplyr::select(Fire_ID = Event_ID,
+                Fire_Year = year,
+                Start_Day,
+                End_Day,
+                Incid_Type,
+                geometry)
+
+### Make sure date columns don't get read in with decimals
+mtbs_control$Fire_Year <- as.character(mtbs_control$Fire_Year, 0)
+mtbs_control$Start_Day <- as.character(mtbs_control$Start_Day, 0)
+mtbs_control$End_Day <- as.character(mtbs_control$End_Day, 0)
+
+### Write out shp for gee
+st_write(mtbs_control,
+         "C:/Users/kjsie/Documents/Dee Lab/USDA AFRI 2023/co_mtbs_control_gee.shp")
+```
+
+## Add CBI data
+### extract CBI to points within MTBS perimeters (sample_fires)
+```{r}
+### list CBI files
+cbi_list <- list.files(path = "C:/Users/kjsie/Documents/Dee Lab/USDA AFRI 2023/cbi_usda_gee",
+                       pattern = "*\\.tif$",
+                       full.names = TRUE)
+
+### open files
+cbi_rasts <- lapply(cbi_list, terra::rast)
+
+### combine rasters into SpatRasterCollection
+cbi_src <- sprc(cbi_rasts)
+
+### merge
+cbi_merge <- merge(cbi_src)
+
+### reproject
+cbi_merge <- terra::project(cbi_merge,
+                            "epsg:5070",
+                            method = "bilinear")
+
+# ### write out for visual check
+# terra::writeRaster(cbi_merge, 
+#                    "C:/Users/kjsie/Documents/Dee Lab/USDA AFRI 2023/co_cbi.tif",
+#                    filetype = "GTiff",
+#                    overwrite = TRUE)
+# st_write(sample_fires, "C:/Users/kjsie/Documents/Dee Lab/USDA AFRI 2023/co_sample_pts.shp")
+
+
+### extract cbi to sample points
+sample_cbi <- terra::extract(cbi_merge, sample_fires)
+
+### combine with sample_fires sf df
+sample_fires <- sample_fires %>%
+  mutate(cbi_severity = sample_cbi[, -1])
+
+### add column to indicate whether point is within an mtbs perimeter
+sample_fires <- sample_fires %>%
+  mutate(burned_mtbs = ifelse(is.na(cbi_severity), 0, 1))
+```
+
+### combine with the rest of the control data
+```{r}
+### get unburned pts
+sample_control <- sample_pts %>%
+  filter(!uid %in% sample_fires$uid)
+
+### add relevant columns
+sample_control <- sample_control %>%
+  mutate(Event_ID = NA,
+         Incid_Type = NA,
+         cbi_severity = NA,
+         burned_mtbs = 0)
+
+### reorder cols
+sample_control <- sample_control %>%
+  dplyr::select(uid, lon, lat, 
+                b1_Severit, b2_Severit, b3_Severit, 
+                treated, WUI, aspect, slope, DEM, nlcd, 
+                b1_Sever_1, b2_Sever_1, b3_Sever_1, 
+                treated_1, WUI_1, aspect_1, slope_1, 
+                DEM_1, nlcd_1, rxburn_bin, CO_nlcd, 
+                aspect_co, slope_co, dem_CO, 
+                Event_ID, Incid_Type, cbi_severity, burned_mtbs,
+                geometry)
+sample_fires <- sample_fires %>%
+  dplyr::select(uid, lon, lat, 
+                b1_Severit, b2_Severit, b3_Severit, 
+                treated, WUI, aspect, slope, DEM, nlcd, 
+                b1_Sever_1, b2_Sever_1, b3_Sever_1, 
+                treated_1, WUI_1, aspect_1, slope_1, 
+                DEM_1, nlcd_1, rxburn_bin, CO_nlcd, 
+                aspect_co, slope_co, dem_CO, 
+                Event_ID, Incid_Type, cbi_severity, burned_mtbs,
+                geometry)
+
+### combine
+all_pts <- rbind(sample_control, 
+                 sample_fires)
+
+### write out
+st_write(all_pts,
+         "C:/Users/kjsie/Documents/Dee Lab/USDA AFRI 2023/all_sample_pts.shp")
+```
+
