@@ -1,0 +1,345 @@
+---
+title: "update_fuel_treat_cbi"
+output: html_document
+date: "2023-08-28"
+---
+
+## Set up
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+### Load packages
+library(tidyverse)
+library(sf)
+library(lubridate)
+library(raster)
+library(terra)
+```
+
+## Perimeters
+### Fuel treatments  
+
+* Dataset: "Hazardous Fuel Treatment Reduction: Polygon"  
+* Data downloaded 8/28/2023
+* Data last updated Aug 18, 2023  
+* url: https://data.fs.usda.gov/geodata/edw/datasets.php  
+* metadata: https://data.fs.usda.gov/geodata/edw/edw_resources/meta/S_USA.Activity_HazFuelTrt_PL.xml  
+
+```{r}
+### Open fuel treatment database
+ft <- st_read("E:/usda_2023/usfs_fuel_treatments/S_USA.Activity_HazFuelTrt_PL.shp") 
+
+### Subset to states around CO
+ft <- ft %>%
+  filter(STATE_ABBR %in% c("UT", "CO",
+                           "WY", "NE",
+                           "KS", "OK",
+                           "AZ", "NM"))
+
+### Reproject fuel treatments
+ft <- ft %>%
+  st_transform(crs = 6350)
+
+### Open Colorado boundary
+co_bound <- raster::getData(name = "GADM",
+                            country = 'USA',
+                            level = 1) %>%
+  st_as_sf() %>%
+  filter(NAME_1 == "Colorado")
+
+### Reproject CO
+co_bound <- co_bound %>%
+  st_transform(crs = 6350) %>%
+  dplyr::select(NAME_1, geometry)
+
+### Intersect treatment boundaries with CO
+ft <- st_intersection(ft, co_bound)
+
+### See which treatment types are present
+unique(ft$METHOD)
+
+### Filter out chemical and grazing
+ft <- ft %>%
+  filter(!METHOD %in% c("Animal",
+                        "Chemical"))
+
+### Take out treatments where completed date = NA
+ft <- ft %>%
+  drop_na(DATE_COMPL)
+
+### Write out
+st_write(ft,
+         "E:/usda_2023/usfs_fuel_treatments/co_treatments.shp")
+```
+
+#### Look at specific treatments
+```{r}
+### how many different treatments are there?
+ft_summ <- ft
+st_geometry(ft_summ) <- NULL
+ft_summ <- ft_summ %>%
+  group_by(TREATMENT_, ACTIVITY) %>%
+  summarise(n_rows = n())
+
+### update TREATMENT_ column
+ft <- ft %>%
+  mutate(TREATMENT_ = ifelse(TREATMENT_ == "N/A",
+                             "Wildfire",
+                             ifelse(ACTIVITY == "Burning of Piled Material",
+                                    "Machine Pile Burn",
+                                    TREATMENT_)))
+
+### still need to get rid of that stray NA!
+ft$TREATMENT_[is.na(ft$TREATMENT_)] <- "Machine Pile Burn"
+
+### Drop Grazing and Wildfire
+ft <- ft %>%
+  filter(!TREATMENT_ %in% c("Grazing", "Wildfire"))
+
+### unique ID for fuel treatment footprints
+tr_footprint <- ft %>%
+  dplyr::select(SUID, ORG, ASU_NBR_UN, ASU_UOM,
+                ADMIN_REGI, ADMIN_FORE, ADMIN_DIST,
+                STATE_ABBR, OWNERSHIP_, PROC_REGIO,
+                PROC_FORES, MGT_AREA_C, NBR_UNITS_,
+                NBR_UNITS1, UOM, DATE_PLANN,
+                DATE_AWARD, DATE_COMPL, FISCAL_YEA,
+                FY_AWARDED, FISCAL_Y_1, FY_PLANNED,
+                KEYPOINT, FUND_CODE, NEPA_DOC_N,
+                ACCOMPLISH, ACCOMPLI_1) %>%
+  distinct() %>%
+  mutate(footprint_id = row_number())
+st_geometry(tr_footprint) <- NULL
+
+### merge back in
+ft <- merge(x = ft, 
+            y = tr_footprint,
+            by = c("SUID", "ORG", "ASU_NBR_UN", "ASU_UOM",
+                "ADMIN_REGI", "ADMIN_FORE", "ADMIN_DIST",
+                "STATE_ABBR", "OWNERSHIP_", "PROC_REGIO",
+                "PROC_FORES", "MGT_AREA_C", "NBR_UNITS_",
+                "NBR_UNITS1", "UOM", "DATE_PLANN",
+                "DATE_AWARD", "DATE_COMPL", "FISCAL_YEA",
+                "FY_AWARDED", "FISCAL_Y_1", "FY_PLANNED",
+                "KEYPOINT", "FUND_CODE", "NEPA_DOC_N",
+                "ACCOMPLISH", "ACCOMPLI_1"),
+            all.x = TRUE)
+
+### make column that categorizes activities
+ft <- ft %>%
+  mutate(treat_cat = ifelse(TREATMENT_ %in% c("Biomass Removal", "Chipping", "Crushing", "Lop and Scatter", "Machine Pile", "Thinning"), "mechanical", ifelse(TREATMENT_ == "Broadcast Burn", "rx_fire", ifelse(TREATMENT_ == "Fire Use", "managed_wildfire", ifelse(TREATMENT_ %in% c("Machine Pile Burn", "Jackpot Burn"), "other", TREATMENT_)))))
+
+### write out treatment key
+ft_summ <- ft
+st_geometry(ft_summ) <- NULL
+ft_summ <- ft_summ %>%
+  group_by(treat_cat, TREATMENT_, ACTIVITY) %>%
+  summarise(n_rows = n())
+ft_summ <- ft_summ %>%
+  dplyr::select(-n_rows)
+write_csv(ft_summ, "treatment_codes.csv")
+
+#### List methods in each footprint
+unique_methods <- ft 
+st_geometry(unique_methods) <- NULL
+unique_methods <-  unique_methods %>%
+  group_by(footprint_id) %>%
+  summarise(all_methods = list(unique(treat_cat)))
+
+### write out ft
+st_write(ft,
+         "E:/usda_2023/usfs_fuel_treatments/co_treatments.shp")
+```
+
+### MTBS fire perimeters
+```{r}
+### open all fires
+mtbs <- st_read("E:/fire_sev_rdd/mtbs/mtbs_perims_DD.shp") %>%
+  st_transform(crs = 6350)
+
+### get column for state
+mtbs <- mtbs %>%
+  mutate(state = stringr::str_extract(Event_ID, "^.{2}"))
+
+### filter to CO and surrounding states
+mtbs <- mtbs %>%
+  filter(state %in% c("CO", "UT", "AZ", "NM", 
+                      "WY", "OK", "KS", "NE"))
+
+### reduce cols
+mtbs <- mtbs %>%
+  dplyr::select(Event_ID, Incid_Type, 
+                Ig_Date, geometry)
+
+### Write out
+st_write(mtbs,
+         "E:/usda_2023/mtbs_co.shp")
+```
+
+## How many rx treatments subsequently burned? (using only broadcast burns, in line with Anna's definition)
+```{r}
+### Open full treatment dataset
+co_treat <- st_read("E:/usda_2023/usfs_fuel_treatments/co_treatments.shp") %>%
+  st_transform(crs = 5070) 
+
+### fix weird column names
+co_treat <- co_treat %>%
+  rename(tr_footprint = ftprnt_,
+         treat_cat = tret_ct)
+
+### restrict to rx fire
+co_rx <- co_treat %>%
+  filter(treat_cat == "rx_fire")
+
+### Open MTBS 
+mtbs <- st_read("E:/usda_2023/mtbs_co.shp") %>%
+  st_transform(crs = 5070) %>%
+  
+  ### drop prescribed fires from this dataset
+  filter(., Incid_Type %in% c("Unknown",
+                              "Wildfire",
+                              "Wildland Fire Use"))
+
+### Separate out year as column
+mtbs <- mtbs %>%
+  mutate(date = day(Ig_Date),
+         month = month(Ig_Date),
+         year = year(Ig_Date))
+
+### Add date cols for treatments
+co_rx <- co_rx %>%
+  mutate(date_comp = day(DATE_CO),
+         month_comp = month(DATE_CO),
+         year_comp = year(DATE_CO))
+
+### treatments completed range from 1997-2023
+
+### drop MTBS fires before 1997
+mtbs <- mtbs %>%
+  filter(year > 1996)
+
+### drop treatments that were completed after end of MTBS time series
+co_rx <- co_rx %>%
+  filter(year_comp < 2021)
+
+##########################################
+##########################################
+### are there footprints with multiple treatments in this dataset?
+length(unique(co_rx$tr_footprint))
+### 577 -- yes
+
+#### figure out what's happening there
+check <- co_rx
+st_geometry(check) <- NULL
+check <- check %>%
+  group_by(tr_footprint) %>%
+  summarise(all_methods = list(unique(ACTIVITY)))
+
+#### which footprint has "Control of Understory Vegetation- Burning"?
+ft_check <- co_rx %>%
+  filter(ACTIVITY == "Control of Understory Vegetation- Burning")
+### 3136
+#### look at this footprint
+ft_check <- co_rx %>%
+  filter(tr_footprint == "3136")
+
+### drop the row with "Control of Understory Vegetation- Burning" from the dataset
+co_rx <- co_rx %>% 
+  filter(!ACTIVITY == "Control of Understory Vegetation- Burning")
+##########################################
+##########################################
+
+### Loop to figure out which treatments burned after treatment
+store_intersect_all <- list()
+
+for (i in 1:length(unique(co_rx$tr_footprint))) {
+  
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get treatment i
+  co_tr_temp <- co_rx[i, ]
+  
+  ### subset to fires that burned after
+  mtbs_temp <- mtbs %>%
+    filter(Ig_Date > co_tr_temp$DATE_CO)
+  
+  ### Intersect
+  temp_intersect <- st_intersection(co_tr_temp, mtbs_temp)
+  
+  ### store intersections as a list
+  store_intersect_all[[i]] <- list(temp_intersect, unique(co_rx$tr_footprint)[i])
+  
+}
+
+### Now need code to see how many treatments actually burned
+### See how many treatments burned
+co_treat_burn <- co_rx[1, ]
+co_treat_burn <- co_treat_burn %>%
+  mutate(tr_footprint = "empty")
+
+### drop geom
+st_geometry(co_treat_burn) <- NULL
+
+### drop cols
+co_treat_burn <- co_treat_burn %>%
+  dplyr::select(tr_footprint)
+
+### add cols for merge
+co_treat_burn <- co_treat_burn %>%
+  mutate(Event_ID = NA, 
+         Incid_Type = NA, 
+         Ig_Date = NA,
+         date = NA, month = NA, year = NA)
+
+for (i in 1:length(store_intersect_all)) {
+# for (i in 1:10) { ## make sure it works on subset of data
+  
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### make df
+  temp_data <- as.data.frame(store_intersect_all[[i]][[1]])
+  
+  ### drop geom
+  temp_data$geometry <- NULL
+  
+  ### Subset columns
+  temp_data <- temp_data %>%
+    dplyr::select(tr_footprint,
+                  Event_ID, Incid_Type, 
+                  Ig_Date,
+                  date, month, year)
+  
+  if(nrow(temp_data) > 0) {
+    
+    ### rbind with co_treat_burn
+    co_treat_burn <- rbind(co_treat_burn,
+                           temp_data)
+  } 
+  
+}
+
+### drop the empty row
+co_treat_burn <- co_treat_burn %>%
+  filter(!tr_footprint == "empty")
+
+### subset to wildfires
+wild_treat <- co_treat_burn %>%
+  filter(Incid_Type == "Wildfire")
+
+### write this out
+write_csv(wild_treat,
+          "E:/usda_2023/co_treatments_that_burned.csv")
+
+### Counts
+length(unique(wild_treat$tr_footprint)) ## 47
+
+### Look more closely
+co_treat_burned <- co_rx %>%
+  filter(tr_footprint %in% wild_treat$tr_footprint)
+
+### write this out
+st_write(co_treat_burned,
+          "E:/usda_2023/co_treatments_that_burned.shp")
+```

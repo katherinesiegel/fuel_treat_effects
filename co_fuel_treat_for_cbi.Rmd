@@ -44,6 +44,7 @@ table(mtbs$Incid_Type)
 
 ### leaving all fire types in for now, but seems like we should restrict moving forward.
 ```
+
 ### export fire perimeters for CBI analysis
 - Fire_ID
 - Fire_Year
@@ -151,6 +152,7 @@ control_mtbs <- mtbs_co %>%
   filter(!Event_ID %in% ft$Event_ID)
 
 ```
+
 #### points in multiple fires?
 ```{r}
 check <- sample_fires
