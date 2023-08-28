@@ -1,0 +1,713 @@
+---
+title: "fs_fuel_treatment"
+author: "Katherine Siegel"
+date: "August 26, 2022"
+output: html_document
+---
+
+## Description
+Code from August-September 2022 to determine which fuel treatments in CO subsequently burned in wildfires.
+
+## Set up
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+### Load packages
+library(tidyverse)
+library(sf)
+library(lubridate)
+library(raster)
+```
+
+## Prep fuel treatment dataset for GEE
+```{r}
+### Open fuel treatment database
+ft <- st_read("C:/Users/Katherine Siegel/Documents/Dee Lab/USDA AFRI/S_USA.Activity_HazFuelTrt_PL.shp") 
+
+### Subset to states around CO
+ft <- ft %>%
+  filter(STATE_ABBR %in% c("UT", "CO",
+                           "WY", "NE",
+                           "KS", "OK"))
+
+### Reproject fuel treatments
+ft <- ft %>%
+  st_transform(crs = 6350)
+
+### Open Colorado boundary
+co_bound <- raster::getData(name = "GADM",
+                            country = 'USA',
+                            level = 1) %>%
+  st_as_sf() %>%
+  filter(NAME_1 == "Colorado")
+
+### Reproject CO
+co_bound <- co_bound %>%
+  st_transform(crs = 6350) %>%
+  dplyr::select(NAME_1, geometry)
+
+# ### Write out CO shp
+# st_write(co_bound,
+#          "C:/Users/Katherine Siegel/Documents/Dee Lab/USDA AFRI/co_boundary.shp")
+
+### Intersect treatment boundaries with CO
+co_ft <- st_intersection(ft, co_bound)
+
+### See which treatment types are present
+unique(co_ft$METHOD)
+
+### Filter out chemical and grazing
+co_ft <- co_ft %>%
+  filter(!METHOD %in% c("Animal",
+                        "Chemical"))
+
+### Take out treatments where completed date = NA
+co_ft <- co_ft %>%
+  drop_na(DATE_COMPL)
+
+### Write out
+st_write(co_ft,
+         "C:/Users/Katherine Siegel/Documents/Dee Lab/USDA AFRI/co_treatments.shp")
+
+### Get range of treatment sizes
+range(co_ft$GIS_ACRES)
+
+
+co_ft %>%
+  ggplot(aes(x = log(GIS_ACRES))) + 
+  geom_histogram(color = "black",
+                 fill = "white",
+                 binwidth = 0.5) +
+  # geom_vline(aes(xintercept = mean(GIS_ACRES)),
+  #           color = "blue", 
+  #           linetype = "dashed",
+  #           size = 1) +
+  NULL
+
+```
+
+### GEE -- don't run this here!
+Use GEE to get forested area in each treatment footprint, based on NLCD 2019 release
+```{python}
+// Code to calculate # of forest pixels within each 
+// fuels treatment in Colorado
+
+// Data sources: NLCD (all years in Earth Engine),
+//               fuel treatment perimeters
+
+// Check that fuel treatment data read in correctly
+//Map.addLayer(ft, {}, "test")
+
+// Subset NLCD to landcover band
+var nl_lc = nlcd.select('landcover');
+
+// Reclassify to forest = 100, not forest = 1 in all years
+// 41, 42, 43 are the forest classes
+var nl_lc_rc = nl_lc.map(function(image){
+  return image.remap(
+    [11, 12, 21, 22, 23, 24, 31, 41, 42, 43, 
+    51, 52, 71, 72, 73, 74, 81, 82, 90, 95],
+    [1, 1, 1, 1, 1, 1, 1, 100, 100, 100, 
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1]);
+});
+//  return image.remap(forest_lc, 1, 0);
+// print('All metadata', nl_lc_rc);     
+
+// Make "sum" layer -- this layer adds land cover data from all years
+var sum = nl_lc_rc.sum();
+//print('All metadata', sum);
+  
+// Reclassify this raster layer to be ever-forested vs. never-forested
+var forest_rc = ee.Image(1)
+      .where(sum.gte(-1).and(sum.lte(95)), 0)
+      .where(sum.gt(99).and(sum.lte(900)), 1);
+//print('All metadata', forest_rc);
+Map.addLayer(forest_rc, {min:0, max: 1}, "land cover")
+
+// Make dummy raster
+var dummy_raster = ee.Image(1)
+      .where(sum.gte(-1).and(sum.lte(95)), 1)
+      .where(sum.gt(99).and(sum.lte(900)), 1);
+
+// Sum pixels that are forest
+var reduced_original = forest_rc.reduceRegions({
+  collection: ft,
+  reducer: ee.Reducer.sum(), 
+  scale: 30
+})
+
+// Rename 'sum' property so it doesn't get overridden
+var reduced_renamed = reduced_original.map(function(feat){
+  return ee.Feature(feat.geometry(), { 
+    unique_id: feat.get('unique_id'),
+    sum_forest: feat.get('sum'),
+  })
+});
+
+// Sum all pixels
+var reduced = dummy_raster.reduceRegions({
+  collection: reduced_renamed,
+  reducer: ee.Reducer.sum(), 
+  scale: 30
+});
+
+// Function to generate pixel counts
+var PixCountFunction = function(feature) {
+  var totalPixels = feature.get('sum')
+  var forested_area = feature.get('sum_forest')
+  var nonforested_area = ee.Number(totalPixels).subtract(forested_area)
+  var feature1 =  feature.set("pixels_total", totalPixels).set("pixels_forest", forested_area).set("pixels_nonforest", nonforested_area)
+  return feature1
+}
+
+// Run function on data
+var forestAreas = reduced.map(PixCountFunction);
+
+// Export csv to drive
+Export.table.toDrive({
+  collection: forestAreas,
+  description: 'forest_area_treatment',
+  fileNamePrefix: 'forest_area_treatment',
+  fileFormat: 'CSV',
+  selectors: ["unique_id", "pixels_forest", "pixels_nonforest"]
+});
+
+
+```
+
+
+### GEE output
+```{r}
+### Open output csv
+ft_area <- read_csv("C:/Users/Katherine Siegel/Documents/Dee Lab/USDA AFRI/forest_area_treatment_CO.csv")
+
+### Add column for total pixels
+ft_area <- ft_area %>%
+  mutate(total_pix = pixels_forest + pixels_nonforest,
+         proportion_forest = pixels_forest/total_pix,
+         proportion_nforest = pixels_nonforest/total_pix)
+
+### Open treatment shp to get areas
+ft_shp <- st_read("C:/Users/Katherine Siegel/Documents/Dee Lab/USDA AFRI/co_treatments.shp")
+
+### Calculate areas (crs = 6350)
+ft_shp <- ft_shp %>%
+  mutate(treatment_area = st_area(ft_shp),
+         treatment_area_ha = as.numeric(treatment_area)/10000)
+
+### Merge with pixel counts
+ft_shp <- merge(ft_shp, ft_area,
+                by = "unique_id")
+
+### Calculate forest area and nonforest area
+ft_shp <- ft_shp %>%
+  mutate(forest_area_ha = treatment_area_ha * proportion_forest,
+         nonforest_area_ha = treatment_area_ha * proportion_nforest)
+
+### Save as shp 
+st_write(ft_shp, 
+         "C:/Users/Katherine Siegel/Documents/Dee Lab/USDA AFRI/co_treatments_forestarea.shp")
+
+### Save as csv
+ft_shp_csv <- ft_shp
+st_geometry(ft_shp_csv) <- NULL
+write_csv(ft_shp_csv, 
+          "C:/Users/Katherine Siegel/Documents/Dee Lab/USDA AFRI/co_treatments_forestarea.csv")
+
+### Visualize
+hist <- ft_shp %>%
+  ggplot(aes(x = proportion_forest)) + 
+  geom_histogram(color = "blue",
+                 fill = "white",
+                 binwidth = 0.05) +
+  xlab("Proportion of pixels forested") +
+  ylab("Number of treatment footprints") +
+  # geom_vline(aes(xintercept = mean(GIS_ACRES)),
+  #           color = "blue", 
+  #           linetype = "dashed",
+  #           size = 1) +
+  NULL
+```
+
+### Combine and subset treatments
+```{r}
+### Open treatment shp and csv
+treat <- st_read("C:/Users/Katherine Siegel/Documents/Dee Lab/USDA AFRI/co_treatments_forestarea.shp")
+treatment_csv <- read.csv("C:/Users/Katherine Siegel/Documents/Dee Lab/USDA AFRI/co_treatments_forestarea.csv")
+treatment_csv$geometry <- NA
+
+### Rename shp cols
+fullnames <- colnames(treatment_csv)
+colnames(treat) <- fullnames
+
+### How many treatments are > 50% forested?
+ft_50 <- treat %>%
+  filter(proportion_forest > 0.5)
+
+### How many treatments have at least 5 forested ha?
+ft_5ha <- treat %>%
+  filter(forest_area_ha >= 5)
+### 6590 treatment records
+
+### Some of these treatment records are different activities that took place at the same location at the same time (ex. thinning and biomass removal)
+
+### Make unique identifier for treatment footprints
+tr_footprint <- ft_5ha 
+st_geometry(tr_footprint) <- NULL
+tr_footprint <- tr_footprint %>%
+  dplyr::select(SUID, ORG, ASU_NBR_UN, ASU_UOM,
+                ADMIN_REGI, ADMIN_FORE, ADMIN_DIST,
+                STATE_ABBR, OWNERSHIP_, PROC_REGIO,
+                PROC_FORES, MGT_AREA_C, NBR_UNITS_,
+                NBR_UNITS1, UOM, DATE_PLANN,
+                DATE_AWARD, DATE_COMPL, FISCAL_YEA,
+                FY_AWARDED, FISCAL_Y_1, FY_PLANNED,
+                KEYPOINT, FUND_CODE, NEPA_DOC_N,
+                ACCOMPLISH, ACCOMPLI_1,
+                pixels_forest) %>%
+  distinct() %>%
+  mutate(footprint_id = row_number())
+
+### Merge footprint ID into full dataset
+ft_5ha_footprint <- merge(ft_5ha,
+                          tr_footprint,
+                          by = c("SUID", "ORG",
+                                 "ASU_NBR_UN",
+                                 "ASU_UOM",
+                                 "ADMIN_REGI",
+                                 "ADMIN_FORE", 
+                                 "ADMIN_DIST",
+                                 "STATE_ABBR",
+                                 "OWNERSHIP_",
+                                 "PROC_REGIO",
+                                 "PROC_FORES",
+                                 "MGT_AREA_C",
+                                 "NBR_UNITS_",
+                                 "NBR_UNITS1",
+                                 "UOM", "DATE_PLANN",
+                                 "DATE_AWARD", "DATE_COMPL",
+                                 "FISCAL_YEA", "FY_AWARDED",
+                                 "FISCAL_Y_1", "FY_PLANNED",
+                                 "KEYPOINT", "FUND_CODE",
+                                 "NEPA_DOC_N", "ACCOMPLISH",
+                                 "ACCOMPLI_1",
+                                 "pixels_forest"),
+                          all = TRUE)
+
+## Do these treatments have multiple methods?
+mech_fire <- ft_5ha_footprint
+st_geometry(mech_fire) <- NULL
+```
+
+## Group by TREATMENT_
+```{r}
+### Drop method_summ column
+ft_5ha_footprint$method_summ <- NULL
+
+## Do these treatments have multiple methods?
+unique(ft_5ha_footprint$TREATMENT_)
+
+### methods categorizing
+TREATMENT_ <- unique(ft_5ha_footprint$TREATMENT_)
+category_tr <- c("fire", "combined", "mechanical",
+                 "mechanical", "mechanical", "mechanical",
+                 "fire", "fire", "mechanical",
+                 "mechanical", "grazing", "NA", "NA")
+treat_cat <- cbind.data.frame(TREATMENT_,
+                              category_tr)
+
+### Add this in
+ft_5ha_footprint <- merge(ft_5ha_footprint,
+                          treat_cat,
+                          by = "TREATMENT_")
+
+### Look at grazing
+grazing <- ft_5ha_footprint %>%
+  filter(category_tr == "grazing")
+
+### Drop grazing
+ft_5ha_footprint <- ft_5ha_footprint %>%
+  filter(!category_tr == "grazing")
+
+### Do these treatments have multiple methods?
+mech_fire <- ft_5ha_footprint
+st_geometry(mech_fire) <- NULL
+
+#### List methods in each footprint
+unique_methods <- mech_fire %>%
+  group_by(footprint_id) %>%
+  summarise(all_methods = list(unique(category_tr)))
+
+### Get footprint IDs for methods
+fire_meth <- unique_methods %>% 
+  filter(all_methods == "fire") %>%
+  mutate(method_summ = "fire")
+mech_meth <- unique_methods %>% 
+  filter(all_methods == "mechanical") %>%
+  mutate(method_summ = "mechanical")
+combined_meth <- unique_methods %>% 
+  filter(all_methods == "combined") %>%
+  mutate(method_summ = "combined")
+na_meth <- unique_methods %>% 
+  filter(is.na(all_methods)) %>%
+  mutate(method_summ = "NA")
+
+### Combine
+methods_summary <- rbind(fire_meth,
+                         mech_meth,
+                         combined_meth,
+                         na_meth)
+methods_summary$all_methods <- NULL
+
+### Footprints with multiple methods
+mult_meth <- mech_fire %>%
+  filter(!footprint_id %in% methods_summary$footprint_id) %>%
+  dplyr::select(footprint_id) %>%
+  mutate(method_summ = "combined")
+
+### rbind
+all_methods <- rbind(mult_meth, methods_summary)
+all_methods <- distinct(all_methods)
+
+### Number of footprints per method
+table(all_methods$method_summ)
+
+### Bring into shp
+ft_5ha_footprint <- merge(ft_5ha_footprint,
+                          all_methods,
+                          by = "footprint_id",
+                          all = TRUE)
+
+### Save as shp 
+st_write(ft_5ha_footprint, 
+         "C:/Users/Katherine Siegel/Documents/Dee Lab/USDA AFRI/co_treatments_subset_for_analysis.shp")
+```
+
+
+### Summary for proposal
+```{r}
+### drop geom
+proposal_dat <- ft_5ha_footprint
+st_geometry(proposal_dat) <- NULL
+
+### summarize treatments
+proposal_treat <- proposal_dat %>%
+  group_by(mthd_sm, 
+           TREATMENT_) %>%
+  summarise(num_occurs = n(),
+            total_area_h = sum(proposal_dat$frst_r_))
+
+proposal_treat$total_area_h <- round(proposal_treat$total_area_h, 2)
+  
+### write out csv
+write_csv(proposal_treat,
+          "C:/Users/Katherine Siegel/Documents/Dee Lab/USDA AFRI/treatment_summary.csv")
+
+### simplify
+proposal_treat$method_summ <- NULL
+proposal_treat <- proposal_treat %>%
+  group_by(TREATMENT_) %>%
+  summarise(num_occurs = sum(num_occurs),
+            total_area_h = sum(total_area_h))
+
+### average treatment area per treatment
+t_area <- proposal_dat %>%
+  group_by(TREATMENT_) %>%
+  summarise(avg_area_ha = mean(forest_area_ha))
+t_area$avg_area_ha <- round(t_area$avg_area_ha)
+
+```
+
+
+## Forest Service land in CO
+```{r}
+### Open CO bounds
+### give it same crs as PAD database
+co_bound <- st_read("C:/Users/Katherine Siegel/Documents/Dee Lab/USDA AFRI/co_boundary.shp") %>%
+  st_transform(crs = 5070)
+
+### Open PAD
+w_pad <- st_read("E:/usgs_pad/pad_west_valid.shp")
+
+### Subset PAD to CO USFS
+co_pad <- w_pad %>%
+  filter(State_Nm == "CO" &
+           Own_Name == "USFS")
+
+### st transform
+co_pad <- co_pad %>%
+  st_transform(crs = 6350)
+
+### write out
+st_write(co_pad,
+         "C:/Users/Katherine Siegel/Documents/Dee Lab/USDA AFRI/co_usfs.shp")
+
+
+### write out as 4269
+co_pad <- co_pad %>% st_transform(crs = 4269)
+co_bound <- co_bound %>% st_transform(crs = 4269)
+st_write(co_pad,
+         "C:/Users/Katherine Siegel/Documents/Dee Lab/USDA AFRI/co_usfs_4269.shp")
+st_write(co_bound,
+         "C:/Users/Katherine Siegel/Documents/Dee Lab/USDA AFRI/co_bound_4269.shp")
+
+### open treatments
+co_treat <- st_read("C:/Users/Katherine Siegel/Documents/Dee Lab/USDA AFRI/co_treatments_subset_for_analysis.shp") %>%
+  st_transform(crs = 4269)
+st_write(co_treat,
+         "C:/Users/Katherine Siegel/Documents/Dee Lab/USDA AFRI/co_treat_4269.shp")
+
+```
+
+## How many treatments subsequently burned?
+```{r}
+### Open treatments
+co_treat <- st_read("C:/Users/Katherine Siegel/Documents/Dee Lab/USDA AFRI/co_treatments_subset_for_analysis.shp") %>%
+  st_transform(crs = 5070)
+
+### Open MTBS 
+mtbs <- st_read("E:/fire_sev_rdd/mtbs/mtbs_perims_DD.shp") %>%
+  st_transform(crs = 5070)
+
+### Restrict MTBS to colorado
+mtbs <- mtbs[grep(paste("CO"),
+                  mtbs$Event_ID), ]
+
+### Separate out year as column
+mtbs <- mtbs %>%
+  mutate(date = day(Ig_Date),
+         month = month(Ig_Date),
+         year = year(Ig_Date))
+
+### Add date cols for treatments
+co_treat <- co_treat %>%
+  mutate(date_comp = day(DATE_CO),
+         month_comp = month(DATE_CO),
+         year_comp = year(DATE_CO))
+
+### treatments completed range from 1997-2022
+
+### drop MTBS fires before 1997
+mtbs <- mtbs %>%
+  filter(year > 1996)
+
+### drop treatments that were completed after end of MTBS time series
+co_treat <- co_treat %>%
+  filter(year_comp < 2021)
+
+### Loop to figure out which treatments burned after treatment
+store_intersect_all <- list()
+
+for (i in 1:length(unique(co_treat$uniqu_d))) {
+  
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get treatment i
+  co_tr_temp <- co_treat[i, ]
+  
+  ### subset to fires that burned after
+  mtbs_temp <- mtbs %>%
+    filter(Ig_Date > co_tr_temp$DATE_CO)
+  
+  ### Intersect
+  temp_intersect <- st_intersection(co_tr_temp, mtbs_temp)
+  
+  ### store intersections as a list
+  store_intersect_all[[i]] <- list(temp_intersect, unique(co_treat$uniqu_d)[i])
+  
+}
+
+### Now need code to see how many treatments actually burned
+### See how many treatments burned
+co_treat_burn <- co_treat[1, ]
+co_treat_burn <- co_treat_burn %>%
+  mutate(uniqu_d = "empty")
+
+### drop geom
+st_geometry(co_treat_burn) <- NULL
+
+### drop cols
+co_treat_burn <- co_treat_burn %>%
+  dplyr::select(ftprnt_, uniqu_d)
+
+### add cols for merge
+co_treat_burn <- co_treat_burn %>%
+  mutate(Event_ID = NA, 
+         Incid_Name = NA,
+         Incid_Type = NA, 
+         Ig_Date = NA,
+         date = NA, month = NA, year = NA)
+
+for (i in 1:length(store_intersect_all)) {
+# for (i in 1:10) { ## make sure it works on subset of data
+  
+  ### make df
+  temp_data <- as.data.frame(store_intersect_all[[i]][[1]])
+  
+  ### drop geom
+  temp_data$geometry <- NULL
+  
+  ### Subset columns
+  temp_data <- temp_data %>%
+    dplyr::select(ftprnt_, uniqu_d,
+                  Event_ID, Incid_Name,
+                  Incid_Type, Ig_Date,
+                  date, month, year)
+  
+  if(nrow(temp_data) > 0) {
+    
+    ### rbind with co_treat_burn
+    co_treat_burn <- rbind(co_treat_burn,
+                           temp_data)
+  } 
+  
+}
+
+### drop the empty row
+co_treat_burn <- co_treat_burn %>%
+  filter(!uniqu_d == "empty")
+
+### subset to wildfires
+wild_treat <- co_treat_burn %>%
+  filter(Incid_Type == "Wildfire")
+
+### write this out
+write_csv(wild_treat,
+          "C:/Users/Katherine Siegel/Documents/Dee Lab/USDA AFRI/co_treatments_that_burned.csv")
+
+### Counts
+length(unique(wild_treat$ftprnt_)) ## 498
+length(unique(wild_treat$uniqu_d)) ## 592
+
+### Look more closely
+co_treat_burned <- co_treat %>%
+  filter(uniqu_d %in% wild_treat$uniqu_d)
+
+### fire treatments
+co_fire <- co_treat_burned %>%
+  filter(mthd_sm == "fire")
+```
+
+### visual for toronto talk
+```{r}
+### treatments that subsequently burned
+treat_burn <- co_treat %>%
+  filter(ftprnt_ %in% co_treat_burned$ftprnt_)
+
+### Beaver Creek treatments
+beaver_creek <- wild_treat %>%
+  filter(Incid_Name == "BEAVER CREEK")
+
+### treatments that burned in beaver creek fire
+bc_treat <- co_treat %>%
+  filter(ftprnt_ %in% beaver_creek$ftprnt_)
+
+### Get these treatments as sf
+### Open treatments
+co_treat <- st_read("C:/Users/Katherine Siegel/Documents/Dee Lab/USDA AFRI/co_treatments_subset_for_analysis.shp") %>%
+  st_transform(crs = 5070) %>%
+  filter(., ftprnt_ %in% beaver_creek$ftprnt_)
+
+### beaver creek sf
+bc_sf <- mtbs %>%
+  filter(Event_ID == "CO4095810663420160619")
+
+### as factor
+co_treat$ftprnt_ <- as.factor(co_treat$ftprnt_)
+
+### drop the footprints that are off to the west
+co_treat <- co_treat %>%
+  filter(!(ftprnt_ == "2265" | ftprnt_ == "2266"))
+
+### visualize
+ggplot() +
+  geom_sf(data = bc_sf) +
+  geom_sf(data = co_treat,
+          aes(color = ftprnt_)) +
+  coord_sf(crs = 5070) +
+  # xlim(106.3, 106.7) +
+  NULL
+
+### open burn severity mosaic from MTBS
+burn_sev <- raster("C:/Users/Katherine Siegel/Documents/Job search/Faculty apps/My materials/2022_2023 cycle/1_9_Toronto/composite_data/mtbs_CO_2016.tif")
+
+# ### figure out its epsg code
+# pj4 <- "+proj=aea +lat_0=23 +lon_0=-96 +lat_1=29.5 +lat_2=45.5 +x_0=0 +y_0=0 +datum=NAD83 +units=m +no_defs"
+# epsg <- rgdal::showEPSG(pj4)
+
+### reproject burn sev
+burn_sev <- projectRaster(burn_sev,
+                          crs = crs(bc_sf))
+
+### reproject sfs to match raster
+p4s_bs <- proj4string(burn_sev)
+co_treat_rpj <- co_treat %>%
+  st_transform(crs = proj4string(burn_sev))
+bc_sf_rpj <- bc_sf %>%
+  st_transform(crs = proj4string(burn_sev))
+
+### write out
+st_write(co_treat_rpj,
+         "C:/Users/Katherine Siegel/Documents/Job search/Faculty apps/My materials/2022_2023 cycle/1_9_Toronto/composite_data/treatments.shp")
+st_write(bc_sf_rpj,
+         "C:/Users/Katherine Siegel/Documents/Job search/Faculty apps/My materials/2022_2023 cycle/1_9_Toronto/composite_data/fire_boundary.shp")
+```
+
+
+## OLD: group by CAT_NM
+```{r}
+#### List methods in each footprint
+unique_methods <- mech_fire %>%
+  group_by(footprint_id) %>%
+  summarise(all_methods = list(unique(CAT_NM)))
+
+### Get footprint IDs for methods
+fire_meth <- unique_methods %>% 
+  filter(all_methods == "Fire") %>%
+  mutate(method_summ = "Fire")
+wildfire_meth <- unique_methods %>% 
+  filter(all_methods == "Wildfire Non-Treatment") %>%
+  mutate(method_summ = "Wildfire Non-Treatment")
+mech_meth <- unique_methods %>% 
+  filter(all_methods == "Mechanical") %>%
+  mutate(method_summ = "Mechanical")
+other_meth <- unique_methods %>% 
+  filter(all_methods == "Other") %>%
+  mutate(method_summ = "Other")
+na_meth <- unique_methods %>% 
+  filter(is.na(all_methods)) %>%
+  mutate(method_summ = "none")
+
+### Combine
+methods_summary <- rbind(fire_meth,
+                         wildfire_meth,
+                         mech_meth,
+                         other_meth,
+                         na_meth)
+methods_summary$all_methods <- NULL
+methods_summary <- methods_summary %>%
+  dplyr::select(footprint_id, methods_summ)
+
+### Footprints with multiple methods
+mult_meth <- mech_fire %>%
+  filter(!footprint_id %in% methods_summary$footprint_id) %>%
+  dplyr::select(footprint_id) %>%
+  mutate(method_summ = "fire and mechanical")
+
+### rbind
+all_methods <- rbind(mult_meth, methods_summary)
+all_methods <- distinct(all_methods)
+
+### Number of footprints per method
+table(all_methods$method_summ)
+
+### Bring into shp
+ft_5ha_footprint <- merge(ft_5ha_footprint,
+                          all_methods,
+                          by = "footprint_id",
+                          all = TRUE)
+```
+Treatments that covered at least 5 ha of forest: 6590. This includes 5650 unique "footprints" (multiple treatments could take place at the same time within a single footprint). Within these treatment footprints, 3532 received mechanical treatments, 2030 received prescribed fire, and 7 received both. Another 76 treatment footprints received wildfire non-treatment, 2 were classified as "none", and 3 as "other"
+
+
