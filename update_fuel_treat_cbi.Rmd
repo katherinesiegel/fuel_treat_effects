@@ -343,3 +343,386 @@ co_treat_burned <- co_rx %>%
 st_write(co_treat_burned,
           "E:/usda_2023/co_treatments_that_burned.shp")
 ```
+
+## Assign sample pts to treatment groups
+### prep sample pts
+```{r}
+### open points
+pts <- st_read("C:/Users/kjsie/Documents/Dee Lab/USDA AFRI 2023/all_sample_pts.shp") %>%
+  st_transform(crs = 5070) %>%
+  
+  ### drop cols from previous analysis
+  dplyr::select(-Evnt_ID,
+                -Incd_Ty,
+                -cb_svrt, 
+                -brnd_mt)
+
+### drop replicated cols
+pts <- distinct(pts)
+
+### fix weird column names
+pts <- pts %>%
+  rename(b1_Severit = b1_Svrt,
+         b2_Severit = b2_Svrt,
+         b3_Severit = b3_Svrt,
+         b1_Sever_1 = b1_Sv_1,
+         b2_Sever_2 = b2_Sv_1,
+         b3_Sever_3 = b3_Sv_1,
+         treated_1 = tretd_1,
+         aspect_1 = aspct_1,
+         rxburn_bin = rxbrn_b,
+         aspect_co = aspct_c,
+         slope_co = slope_c)
+```
+
+### rx fire?
+```{r}
+### intersect sample pts with rx fires (co_rx)
+pts_rx <- pts %>%
+  dplyr::select(uid, geometry) %>%
+  st_intersection(co_rx)
+
+### restrict cols
+st_geometry(pts_rx) <- NULL
+pts_rx <- pts_rx %>%
+  dplyr::select(uid) %>%
+  distinct() %>%
+  mutate(treated_rx = 1)
+
+### points outside of rx fire polygons
+pts_non_rx <- pts %>%
+  filter(!uid %in% pts_rx$uid) %>%
+  mutate(treated_rx = 0)
+st_geometry(pts_non_rx) <- NULL
+pts_non_rx <- pts_non_rx %>%
+  dplyr::select(uid, treated_rx)
+
+### combine
+pts_rx_01 <- rbind(pts_non_rx, 
+                   pts_rx)
+```
+
+### burned in subsequent wildfires?
+```{r}
+### Which wildfires do we care about?
+length(unique(wild_treat$Event_ID)) ## only 14 fires
+
+### subset mtbs to those fires
+mtbs_rx <- mtbs %>%
+  filter(Event_ID %in% wild_treat$Event_ID)
+
+### which sample points burned in these fires?
+pts_mtbs <- pts %>%
+  dplyr::select(uid, geometry) %>%
+  st_intersection(mtbs_rx)
+
+### restrict cols
+st_geometry(pts_mtbs) <- NULL
+pts_mtbs <- pts_mtbs %>%
+  dplyr::select(uid) %>%
+  distinct() %>%
+  mutate(burned_wf = 1)
+
+### points that did not burn in mtbs fires
+pts_non_mtbs <- pts %>%
+  filter(!uid %in% pts_mtbs$uid) %>%
+  mutate(burned_wf = 0)
+st_geometry(pts_non_mtbs) <- NULL
+pts_non_mtbs <- pts_non_mtbs %>%
+  dplyr::select(uid, burned_wf)
+
+### combine
+pts_mtbs_01 <- rbind(pts_non_mtbs, 
+                     pts_mtbs)
+```
+
+### untreated points that burned in any wildfire?
+```{r}
+### subset points
+untreat_burn_other <- pts %>%
+  dplyr::select(uid, geometry) %>%
+  filter(!(uid %in% pts_rx$uid |
+             uid %in% pts_mtbs$uid)) 
+
+### subset mtbs to those fires
+mtbs_other <- mtbs %>%
+  filter(!Event_ID %in% wild_treat$Event_ID)
+
+### which sample points burned in these fires?
+untreat_burn_other <- untreat_burn_other %>%
+  st_intersection(mtbs_other)
+
+### which fire ids are these?
+other_fire_ids <- untreat_burn_other %>%
+  dplyr::select(Event_ID, Incid_Type) 
+st_geometry(other_fire_ids) <- NULL
+other_fire_ids <- other_fire_ids %>%
+  distinct()
+
+### restrict cols
+st_geometry(untreat_burn_other) <- NULL
+untreat_burn_other <- untreat_burn_other %>%
+  dplyr::select(uid) %>%
+  distinct() %>%
+  mutate(burned_other_wf = 1)
+
+### points that did not burn in any fires
+pts_never_burned <- pts %>%
+  filter(!uid %in% untreat_burn_other$uid) %>%
+  mutate(burned_other_wf = 0)
+st_geometry(pts_never_burned) <- NULL
+pts_never_burned <- pts_never_burned %>%
+  dplyr::select(uid, burned_other_wf)
+
+### combine
+pts_other_fires <- rbind(untreat_burn_other, 
+                     pts_never_burned)
+```
+
+
+### combine
+```{r}
+### combine rx and mtbs
+pts_all <- merge(pts_rx_01,
+                 pts_mtbs_01,
+                 by = "uid")
+
+### add columns to specify treatments
+pts_all <- pts_all %>%
+  mutate(treat_lvl = ifelse(treated_rx < 1 & burned_wf < 1,
+                            
+                            ### these points were NOT TREATED and did NOT BURN
+                            "untreated_nowf",
+                            
+                            ### these points were NOT TREATED but DID BURN
+                            ifelse(treated_rx < 1 & burned_wf > 0,
+                                   "untreated_wf",
+                                   
+                                   ### TREATED and BURNED
+                                   ifelse(treated_rx > 0 & burned_wf > 0,
+                                          "treated_wf",
+                                          
+                                          ### otherwise, TREATED but did NOT BURN
+                                          "treated_nowf"))))
+
+# ### check that this looks right
+# check <- pts_all %>% 
+#   group_by(treated_rx, burned_wf, treat_lvl) %>% 
+#   summarise(n_rows = n())
+
+### summary stats
+table(pts_all$treat_lvl)
+#   treated_nowf     treated_wf untreated_nowf   untreated_wf 
+#          2403            362         270297           6213 
+
+### add wide version of the treatment level data
+pts_all <- pts_all %>%
+  mutate(treat_lvl_wide = treat_lvl) %>%
+  pivot_wider(names_from = treat_lvl_wide,
+              values_from = treat_lvl_wide) 
+
+### update values in wide version
+pts_all <- pts_all %>%
+  mutate(untreated_nowf = ifelse(is.na(untreated_nowf), 0, 1),
+         treated_nowf = ifelse(is.na(treated_nowf), 0, 1),
+         untreated_wf = ifelse(is.na(untreated_wf), 0, 1),
+         treated_wf = ifelse(is.na(treated_wf), 0, 1))
+
+# ### verify unique labeling
+# check <- pts_all %>%
+#   mutate(test = untreated_nowf + treated_nowf + untreated_wf + treated_wf)
+
+### add in column for whether the point burned in another wildfire
+pts_all <- merge(pts_all,
+                 pts_other_fires,
+                 by = "uid")
+
+### write this out
+write_csv(pts_all,
+          "pts_treatment_level.csv")
+```
+
+## CBI for pts that burned in comparison wf
+### missing cbi for one fire
+```{r}
+# ### missing CBI for one fire: CO4060910587920200813
+# 
+# ### write out that fire perimeter for CBI in GEE
+# missing_fire <- mtbs %>% filter(Event_ID == "CO4060910587920200813")
+# ### assign julian start and end date based on state dates from Parks et al. 2019
+# missing_fire <- missing_fire %>%
+#   mutate(Start_Day = 152,
+#          End_Day = 258)
+# ### Select columns for GEE
+# missing_fire <- missing_fire %>%
+#   dplyr::select(Fire_ID = Event_ID,
+#                 Fire_Year = year,
+#                 Start_Day,
+#                 End_Day,
+#                 Incid_Type,
+#                 geometry)
+# ### Make sure date columns don't get read in with decimals
+# missing_fire$Fire_Year <- as.character(missing_fire$Fire_Year, 0)
+# missing_fire$Start_Day <- as.character(missing_fire$Start_Day, 0)
+# missing_fire$End_Day <- as.character(missing_fire$End_Day, 0)
+# ## Write out shp for gee
+# st_write(missing_fire,
+#          "C:/Users/kjsie/Documents/Dee Lab/USDA AFRI 2023/co_mtbs_missing_gee.shp")
+```
+
+### cbi for pts in sample fires
+```{r}
+### filter pts data
+pts_cbi <- pts %>%
+  filter(uid %in% pts_mtbs$uid) %>%
+  dplyr::select(uid, geometry)
+
+### we only need CBI from a handful of the fires I ran it for:
+length(unique(mtbs_rx$Event_ID))
+
+### list CBI files
+cbi_list <- list.files(path = "C:/Users/kjsie/Documents/Dee Lab/USDA AFRI 2023/cbi_usda_gee",
+                       pattern = "*\\.tif$",
+                       full.names = TRUE)
+
+### make column to match cbi file names
+mtbs_rx <- mtbs_rx %>%
+  mutate(cbi_files = paste0("C:/Users/kjsie/Documents/Dee Lab/USDA AFRI 2023/cbi_usda_gee/",
+                            Event_ID, 
+                            "_CBI_bc.tif"))
+
+### subset cbi_list
+cbi_subset <- subset(cbi_list, 
+                     cbi_list %in% mtbs_rx$cbi_files)
+
+### open files
+cbi_rasts <- lapply(cbi_subset, terra::rast)
+
+### combine rasters into SpatRasterCollection
+cbi_src <- sprc(cbi_rasts)
+
+### merge
+cbi_merge <- merge(cbi_src)
+
+### reproject
+cbi_merge <- terra::project(cbi_merge,
+                            "epsg:5070",
+                            method = "bilinear")
+
+# ### write out for visual check
+# terra::writeRaster(cbi_merge,
+#                    "C:/Users/kjsie/Documents/Dee Lab/USDA AFRI 2023/co_cbi_2.tif",
+#                    filetype = "GTiff",
+#                    overwrite = TRUE)
+# st_write(sample_fires, "C:/Users/kjsie/Documents/Dee Lab/USDA AFRI 2023/co_sample_pts.shp")
+
+### extract cbi to sample points
+sample_cbi <- terra::extract(cbi_merge, pts_cbi)
+
+### combine with pts_cbi sf df
+pts_cbi <- pts_cbi %>%
+  mutate(cbi_severity = sample_cbi[, -1])
+
+### why are there NA values?
+# cbi_na <- pts_cbi %>%
+#   filter(is.na(cbi_severity))
+# cbi_na_burned <- st_intersection(cbi_na,
+#                                  mtbs)
+### these points are just barely outside the fire perimeter (difference between polygon of fire perimeter and raster...)
+
+### add column to indicate whether point is within an mtbs perimeter
+pts_cbi <- pts_cbi %>%
+  mutate(outside_perimeter = ifelse(is.na(cbi_severity), 1, 0))
+```
+
+### cbi for other fires
+```{r}
+### get relevant pts
+cbi_other <- untreat_burn_other %>%
+  mutate(cbi_files = paste0("C:/Users/kjsie/Documents/Dee Lab/USDA AFRI 2023/cbi_usda_gee/",
+                            Event_ID, 
+                            "_CBI_bc.tif"))
+
+### subset cbi_list
+cbi_subset_other <- subset(cbi_list, 
+                     cbi_list %in% other_fire_ids$cbi_files)
+
+### loop and extract
+store_intersect_cbi <- list()
+
+for (i in 1:length(cbi_subset_other)) {
+  
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### fire name i
+  fire_name_i <- cbi_subset_other[i]
+  
+  ### get pts that are in that fire
+  fire_pts <- cbi_other %>%
+    filter(cbi_files == fire_name_i)
+  
+  ### open corresponding cbi raster
+  cbi_ras <- rast(fire_name_i)
+  
+  ### reproject
+  cbi_ras <- terra::project(cbi_ras,
+                            "epsg:5070",
+                            method = "bilinear")
+  
+  ### extract cbi value
+  cbi_ext <- terra::extract(cbi_ras, fire_pts,
+                            bind = TRUE) %>%
+    st_as_sf()
+  
+  
+  ### drop geom
+  st_geometry(cbi_ext) <- NULL
+  
+  if(nrow(cbi_ext) > 0) {
+    
+    ### store intersections as a list
+  store_intersect_cbi[[i]] <- cbi_ext
+  } 
+
+}
+  
+### combine
+cbi_other_severity <- bind_rows(store_intersect_cbi)  
+
+### drop NA values
+cbi_other_severity <- cbi_other_severity %>%
+  filter(!is.na(CBI_bc))
+
+### simplify
+cbi_other_severity <- cbi_other_severity %>%
+  dplyr::select(uid, 
+                other_wf_id = Event_ID,
+                Ig_Date,
+                year,
+                cbi_sev_other = CBI_bc)
+
+### make code
+cbi_other_severity <- cbi_other_severity %>%
+  mutate(code = paste0(uid, "_", year))
+
+### some of them burned multiple times
+other_summ <- cbi_other_severity %>%
+  group_by(uid) %>%
+  summarise(max_year = max(year)) %>%
+  mutate(code = paste0(uid, "_", max_year)) %>%
+  dplyr::select(-max_year)
+
+### multiple fires
+mult_burn <- cbi_other_severity %>%
+  filter(code %in% other_summ$code)
+
+### drop those from cbi_other_severity
+cbi_other_2 <- cbi_other_severity %>%
+  filter(!code %in% mult_burn$code)
+
+### combine
+cbi_other_2 <- rbind(cbi_other_2,
+                     mult_burn)
+```
+
