@@ -617,11 +617,10 @@ cbi_merge <- terra::project(cbi_merge,
 # st_write(sample_fires, "C:/Users/kjsie/Documents/Dee Lab/USDA AFRI 2023/co_sample_pts.shp")
 
 ### extract cbi to sample points
-sample_cbi <- terra::extract(cbi_merge, pts_cbi)
-
-### combine with pts_cbi sf df
-pts_cbi <- pts_cbi %>%
-  mutate(cbi_severity = sample_cbi[, -1])
+sample_cbi <- terra::extract(cbi_merge, 
+                             pts_cbi,
+                             bind = TRUE) %>%
+  st_as_sf()
 
 ### why are there NA values?
 # cbi_na <- pts_cbi %>%
@@ -631,8 +630,16 @@ pts_cbi <- pts_cbi %>%
 ### these points are just barely outside the fire perimeter (difference between polygon of fire perimeter and raster...)
 
 ### add column to indicate whether point is within an mtbs perimeter
-pts_cbi <- pts_cbi %>%
+sample_cbi <- sample_cbi %>%
   mutate(outside_perimeter = ifelse(is.na(cbi_severity), 1, 0))
+
+### get fire ID for these pts
+pts_cbi <- st_intersection(sample_cbi, mtbs_rx)
+
+### reduce columns
+pts_cbi <- pts_cbi %>%
+  dplyr::select(-cbi_files)
+st_geometry(pts_cbi) <- NULL
 ```
 
 ### cbi for other fires
@@ -719,10 +726,80 @@ mult_burn <- cbi_other_severity %>%
 
 ### drop those from cbi_other_severity
 cbi_other_2 <- cbi_other_severity %>%
-  filter(!code %in% mult_burn$code)
+  filter(!uid %in% mult_burn$uid)
 
 ### combine
 cbi_other_2 <- rbind(cbi_other_2,
                      mult_burn)
 ```
 
+#### combine
+```{r}
+### check column names
+names(pts_cbi)
+names(cbi_other_2)
+
+### update column names
+pts_cbi <- pts_cbi %>%
+  dplyr::select(uid, 
+                cbi_sev = cbi_severity, 
+                wf_id = Event_ID,
+                wf_year = year)
+cbi_other_2 <- cbi_other_2 %>%
+  dplyr::select(uid,
+                other_cbi_sev = cbi_sev_other,
+                other_wf_id = other_wf_id,
+                other_wf_year = year)
+
+### merge them with pts_all
+pts_all <- merge(x = pts_all,
+                 y = pts_cbi,
+                 by = "uid",
+                 all = TRUE)
+pts_all <- merge(x = pts_all,
+                 y = cbi_other_2,
+                 by = "uid",
+                 all = TRUE)
+
+### write this out
+write_csv(pts_all,
+          "pts_treatment_level_cbi.csv")
+
+### combine with original sf df
+all_data <- merge(pts,
+                  pts_all,
+                  by = "uid",
+                  all = TRUE)
+nrow(all_data)
+
+### write out
+st_write(all_data,
+         "all_data_cbi.shp")
+
+### write it out as a csv
+write_csv(all_data,
+         "all_data_cbi.csv")
+
+```
+
+#### output metadata
+pts_treatment_level_cbi.csv  
+
+* uid: unique identifier for the sample points  
+* treated_rx: binary, 1 = treated with prescribed fire, 0 = no prescribed fire  
+* burned_wf: binary, 1 = burned in subsequent wildfire that affected prescribed fire footprint, 0 = did not burn in subsequent wildfire that affected prescribed fire footprint  
+* treat_lvl: combination of rx fire and wildfire exposure  
+   - treated_wf: located inside prescribed fire perimeter AND burned in subsequent wildfire  
+   - treated_nowf: located inside prescribed fire perimeter but did NOT burn in subsequent wildfire  
+   - untreated_wf: located outside prescribed fire perimeter AND burned in subsequent wildfire (only including wildfires that intersect with rx fire treatment footprints)  
+   - untreated_nowf: located outside prescribed fire perimeter and did NOT burn in subsequent wildfire (only including wildfires that intersect with rx fire treatment footprints)  
+* untreated_nowf: binary, 1 = point received untreated_nowf treatment, 0 = point did not receive that treatment  
+* treated_nowf: binary, 1 = point received treated_nowf treatment, 0 = point did not receive that treatment  
+* untreated_wf: binary, 1 = point received untreated_wf treatment, 0 = point did not receive that treatment  
+* treated_wf: binary, 1 = point received treated_wf treatment, 0 = point did not receive that treatment  
+* burned_other_wf: binary, 1 = point was located outside of prescribed fire treatment footprint and did not burn in a wildfire that subsequently affected a prescrbed fire footprint, BUT it burned in a different wildfire  
+* cbi_sev: composite burn index severity value for points that burned in wildfires that burned through prescribed fire footprints after prescribed fire treatment occurred (continuous value, 0-3. NA value indicates point was located outside of wildfire)  
+* wf_id: MTBS Event_ID code for the wildfire that caused cbi_sev  
+* other_cbi_sev: composite burn index severity value for points classified as burned_other_wf (points located outside of the prescribed fire footprints that burned in wildfires that did not affect the prescribed fire footprints) (continuous value, 0-3. NA value indicates point was located outside of wildfire)    
+* other_wf_id: MTBS Event_ID code for the wildfire that caused other_cbi_sev  
+* other_wf_year: year in which other_wf_id burned
