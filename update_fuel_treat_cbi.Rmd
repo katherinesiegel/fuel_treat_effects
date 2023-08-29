@@ -761,13 +761,49 @@ pts_all <- merge(x = pts_all,
                  by = "uid",
                  all = TRUE)
 
+### deal with NA values in CBI that are from edge of fire perimeter
+#### untreated_wf points
+c1 <- pts_all %>% filter(treat_lvl == "untreated_wf")
+c1 <- c1 %>%
+  mutate(treat_lvl = ifelse(treat_lvl == "untreated_wf" & is.na(cbi_sev),
+                            "untreated_nowf", treat_lvl),
+         untreated_wf = ifelse(treat_lvl == "untreated_nowf" & is.na(cbi_sev),
+                               0, 1),
+         untreated_nowf = ifelse(treat_lvl == "untreated_nowf" & is.na(cbi_sev),
+                               1, 0),
+         wf_id = ifelse(treat_lvl == "untreated_nowf" & is.na(cbi_sev),
+                        NA, wf_id),
+         wf_year  = ifelse(treat_lvl == "untreated_nowf" & is.na(cbi_sev),
+                        NA, wf_year))
+#### put these back in the main dataset
+pts_fix <- pts_all %>%
+  filter(!treat_lvl == "untreated_wf")
+pts_fix <- rbind(pts_fix,
+                 c1)
+
+#### burned_other_wf points
+c2 <- pts_all %>% filter(burned_other_wf > 0)
+c2 <- c2 %>%
+  mutate(burned_other_wf = ifelse(burned_other_wf > 0 & is.na(other_cbi_sev),
+                            0, burned_other_wf))
+pts_fix <- pts_fix %>%
+  filter(!burned_other_wf > 0)
+pts_fix <- rbind(pts_fix,
+                 c2)
+
+### make simple csv of treatment levels
+pts_treat_lvl <- pts_fix %>%
+  dplyr::select(uid, treated_rx, burned_wf, treat_lvl, 
+                untreated_nowf, treated_nowf,
+                untreated_wf, treated_wf, burned_other_wf)
+
 ### write this out
-write_csv(pts_all,
+write_csv(pts_treat_lvl,
           "pts_treatment_level_cbi.csv")
 
 ### combine with original sf df
 all_data <- merge(pts,
-                  pts_all,
+                  pts_fix,
                   by = "uid",
                   all = TRUE)
 nrow(all_data)
@@ -803,3 +839,5 @@ pts_treatment_level_cbi.csv
 * other_cbi_sev: composite burn index severity value for points classified as burned_other_wf (points located outside of the prescribed fire footprints that burned in wildfires that did not affect the prescribed fire footprints) (continuous value, 0-3. NA value indicates point was located outside of wildfire)    
 * other_wf_id: MTBS Event_ID code for the wildfire that caused other_cbi_sev  
 * other_wf_year: year in which other_wf_id burned
+
+
