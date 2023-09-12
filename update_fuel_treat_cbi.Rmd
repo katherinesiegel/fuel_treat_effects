@@ -840,4 +840,91 @@ pts_treatment_level_cbi.csv
 * other_wf_id: MTBS Event_ID code for the wildfire that caused other_cbi_sev  
 * other_wf_year: year in which other_wf_id burned
 
+## map for usda 
+```{r}
+### fire perims
+# CO3740210724320120513
+# CO3746110780820180601
+# CO3765810847420180722
+
+### treatments
+# 8156 (in CO3765810847420180722)
+  
+### open mtbs fires, filter to fires with treatment footprints
+mtbs <- st_read("E:/usda_2023/mtbs_co.shp") %>%
+  filter(., Event_ID == "CO3765810847420180722") %>%
+  st_transform(., 5070)
+
+### open treatment polygon, filter to treatment within fire
+rxfire <- st_read("E:/usda_2023/co_treatments_that_burned.shp") %>%
+  filter(., tr_ftpr == "8156")
+
+# ### plot
+# ggplot() +
+#   geom_sf(data = mtbs) +
+#   geom_sf(data = rxfire,
+#           aes(color = tr_ftpr)) +
+#   coord_sf(crs = 5070) +
+#   # xlim(106.3, 106.7) +
+#   NULL
+
+### open raster of CBI for fire of interest
+### list CBI files
+cbi_rx <- terra::rast("C:/Users/kjsie/Documents/Dee Lab/USDA AFRI 2023/cbi_usda_gee/CO3765810847420180722_CBI_bc.tif")
+
+# ### reproject burn sev
+# cbi_rx <- projectRaster(cbi_rx,
+#                         crs = crs(rxfire))
+
+### reproject sfs to match raster
+rxfire <- rxfire %>%
+  st_transform(4326)
+mtbs <- mtbs %>%
+  st_transform(4326)
+
+# ### write out
+# st_write(rxfire,
+#          "rx_fire_demo.shp")
+# st_write(mtbs,
+#          "fire_perim_demo.shp")
+
+### raster to dataframe
+cbi_df <- as.data.frame(cbi_rx, 
+                        xy = TRUE)
+extents <- extent(cbi_df)
+
+### change name of cbi layer
+cbi_df <- cbi_df %>%
+  dplyr::select(x, y, CBI = CBI_bc)
+
+# ### Set up extent for plotting
+# ymax <- 4051522
+# extents@ymax <- ymax
+# ymin <- 3945472
+# extents@ymin <- ymin
+# xmax <- 445624.1
+# extents@xmax <-  xmax
+# xmin <- 325264.1
+# extents@xmin <- xmin
+
+ggplot() +
+  geom_raster(data = cbi_df, 
+              aes(x = x, y = y, fill = CBI)) +
+  scale_fill_gradient2(low="#FF9999", high="#CC0000", guide="colorbar") +
+  ylab("") +
+  xlab("") +
+  geom_sf(data = mtbs, 
+          color = "gray37",
+          fill = NA) +
+  geom_sf(data = rxfire, 
+          color = "black",
+          fill = NA,
+          lwd = 1) +
+  coord_sf(crs = 4326,) +
+  theme_void() +
+ NULL
+
+ggsave("plateau_fire_2018.png")
+```
+```
 
