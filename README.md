@@ -31,7 +31,9 @@
 * other_wf_year: year in which other_wf_id burned
 
 ## Associated GEE scripts  
+Folder name: fuel_treat_rdd  
 
 * fuel_treat_cbi: CBI code for mtbs and firedpy polygons that intersect with ft polygons  
-* fuel_treat_lc: calculates forested area for each fuel treatment in the year before the wildfire
+* fuel_treat_lc: calculates forested area for each fuel treatment in the year before the wildfire  
+* ft_forest_pts: extract land cover to sample pts
 
