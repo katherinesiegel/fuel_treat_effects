@@ -30,4 +30,8 @@
 * other_wf_id: MTBS Event_ID code for the wildfire that caused other_cbi_sev  
 * other_wf_year: year in which other_wf_id burned
 
+## Associated GEE scripts  
+
+* fuel_treat_cbi: CBI code for mtbs and firedpy polygons that intersect with ft polygons  
+* fuel_treat_lc: calculates forested area for each fuel treatment in the year before the wildfire
 
