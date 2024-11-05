@@ -1,0 +1,231 @@
+---
+title: "talk_figs"
+output: html_document
+date: "2024-02-13"
+---
+
+## Set up
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+### Load packages
+library(tidyverse)
+library(sf)
+library(lubridate)
+library(raster)
+library(terra)
+library(stars)
+# library(viridis)
+# library(scales)
+library(lwgeom)
+library(googledrive)
+# library(furrr)
+# library(sfheaders)
+library(units)
+library(stringr)
+library(rmapshaper)
+library(rgdal)
+```
+
+### inset: Graves Mountain Fire in WA in 2015
+```{r}
+### open fire perimeters with fuel reduction treatments
+fires_hfr <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fires_haz_ft.shp") 
+
+### subset to WA4863311833720150814
+wa_fire <- fires_hfr %>% filter(Fire_ID == "WA4863311833720150814")
+
+### clean
+rm(fires_hfr)
+gc()
+
+### fts that burned
+burned_ft <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/all_burned_fuel_treats_year_updated_polygons_fireID.shp") %>%
+  rename(., STATE_ABBR = STATE_A,
+         activity_code = ACTIVITY_,
+         activity = ACTIVITY,
+         treatment = TREATMENT_,
+         DATE_COMP = DATE_CO,
+         date_comp = dat_cmp,
+         month_comp = mnth_cm,
+         year_comp = yer_cmp,
+         first_fire_id = frst_fr_d,
+         first_fire_source = frst_fr_s,
+         fire_ig_date = fr_g_dt) %>%
+  filter(., first_fire_id == "WA4863311833720150814")
+
+### simplify -- keep 1
+burned_ft <- burned_ft %>%
+  filter(ft_id == "139871")
+
+### intersect
+burned_ft <- st_intersection(burned_ft, wa_fire)
+
+### plot
+ggplot() +
+    geom_sf(data = burned_ft, fill = "lightskyblue3", color = NA) +
+  geom_sf(data = wa_fire, fill = NA, color = "black", lwd = 2) +
+  theme_void()
+ggsave("ex_fire_esiil.png")
+
+### open CBI
+cbi_wa <- raster("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_mtbs_firedpy/WA4863311833720150814.tif")
+
+### convert to df
+cbi_df <- as.data.frame(cbi_wa, xy = TRUE) %>%
+  na.omit() 
+
+### plot
+ggplot() +
+  geom_raster(data = cbi_df, aes(x = x, y = y, fill = "CBI_bc")) +
+  geom_sf(data = burned_ft, fill = NA, color = "black", lwd = 1) +
+  geom_sf(data = wa_fire, fill = NA, color = "black", lwd = 2) +
+  theme_void()
+```
+
+## map of fires
+```{r}
+### us boundary
+w_us <- st_read("E:/fire_sev_rdd/w_states.shp") %>%
+  st_transform(.,
+               crs = 4269)
+
+### open fires that had fuel treatments
+fires_hfr <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fires_haz_ft.shp") %>%
+  st_transform(.,
+               crs = 4269)
+
+### update crs
+w_us <- w_us %>%
+  st_transform(crs = 5069)
+fires_hfr <- fires_hfr %>%
+  st_transform(crs = 5069)
+
+### map
+ggplot() +
+  geom_sf(data = w_us, 
+          fill = NA,
+          color = "black",
+          lw = 0.6) +
+  geom_sf(data = fires_hfr,
+          color = "red3",
+          fill = "red3") +
+  theme_void()
+ggsave("all_fires_fts.png")
+
+### fires 2012 onward
+fires_viirs <- fires_hfr %>%
+  filter(Fire_Year > 2011)
+
+### map
+ggplot() +
+  geom_sf(data = w_us, 
+          fill = NA,
+          color = "black") +
+  geom_sf(data = fires_viirs,
+          color = "red3",
+          fill = "red3") +
+  theme_void()
+ggsave("fires_since2012_fts.png")
+```
+## western fire
+```{r}
+w_pts <- st_read("E:/labcomp_wf_resample_1km/all_states_pts.shp")
+cali <- read.csv("E:/old_harddrive/western_fire/all_forests/cali_matched_allvars.csv")
+
+cali$geometry <- NULL
+
+w_pts <- w_pts %>% filter(UID %in% cali$UID)
+st_write(w_pts, "pts_for_talk.shp")
+
+cali <- cali %>% dplyr::select(UID, prot_cat_recl)
+
+w_pts <- merge(w_pts, cali, by = "UID")
+
+### crs
+w_pts <- w_pts %>%
+  st_transform(crs = 5070)
+
+### subset fire
+rim_fire <- fires_hfr %>%
+  filter(Fire_ID == "CA3785712008620130817")
+rim_fire <- rim_fire %>%
+  st_transform(crs = 5070)
+
+### open pad 
+pad <- st_read("E:/usgs_pad/pad_west_valid.shp")
+
+### subset pad to fire
+pad <- pad %>%
+  filter(State_Nm == "CA")
+pad <- st_intersection(pad, rim_fire)
+
+### subset pts
+rim_pts <- st_intersection(w_pts, rim_fire)
+
+### write things out
+st_write(rim_fire, "rim_fire.shp")
+st_write(pad, "rim_pad.shp")
+st_write(rim_pts, "rim_pts.shp")
+
+######
+## log fire
+######
+mtbs <- st_read("E:/fire_sev_rdd/mtbs/mtbs_perims_DD.shp") 
+
+### subset fire
+log_fire <- mtbs %>%
+  filter(Event_ID == "CA4154812306220140731")
+log_fire <- log_fire %>%
+  st_transform(crs = 5070)
+
+### open pad 
+pad <- st_read("E:/usgs_pad/pad_west_valid.shp")
+
+### subset pad to fire
+pad <- pad %>%
+  filter(State_Nm == "CA")
+log_pad <- st_intersection(pad, log_fire)
+
+### subset pts
+log_pts <- st_intersection(w_pts, log_fire)
+
+### write things out
+st_write(log_fire, "log_fire.shp")
+st_write(log_pad, "log_pad.shp")
+st_write(log_pts, "log_pts.shp")
+
+### open all pts
+w_pts <- st_read("E:/labcomp_wf_resample_1km/all_states_pts.shp")
+w_pts <- w_pts %>% st_transform(crs = 5070)
+all_log_pts <- st_intersection(w_pts, log_fire)
+st_write(all_log_pts, "prematch_log_pts.shp")
+# ggplot() + geom_sf(data = all_log_pts) + geom_sf(data = log_fire, fill = NA)
+
+### crop layers
+gee_elev <- terra::rast("logfire_elev_buff.tif")
+gee_slope <- terra::rast("logfire_slope_buff.tif")
+
+logfire <- terra::vect("log_fire.shp")
+
+# gee_elev <- raster("logfire_elev_buff.tif")
+# gee_slope <- raster("logfire_slope_buff.tif")
+
+# gee_elev <- projectRaster(gee_elev,
+#                           crs = 5070)
+# gee_slope <- projectRaster(gee_slope,
+#                            crs = 5070)
+
+gee_elev <- terra::project(gee_elev, "epsg:5070", method = "near")
+gee_slope <- terra::project(gee_slope, "epsg:5070", method = "near")
+
+elev <- crop(gee_elev, logfire)
+slope <- crop(gee_slope, logfire)
+
+elev <- mask(elev, logfire)
+slope <- mask(slope, logfire)
+
+writeRaster(elev, "gee_elev.tif")
+writeRaster(slope, "gee_slope.tif")
+```
+

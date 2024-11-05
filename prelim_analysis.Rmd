@@ -1,0 +1,726 @@
+---
+title: "prelim_analysis"
+output: html_document
+date: "2024-02-09"
+---
+
+## Description
+Initial analysis
+
+Picks up after covariate_workflow.Rmd using subset of fires
+
+Demo: https://bookdown.org/paul/applied-causal-analysis/lab-r-code-1.html
+
+
+more fires:
+WA4863311833720150814
+CO3937110704320180703
+CO3717510737520170802
+CO3740210724320120513
+NM3658710602220170516
+AZ3448811140320160519
+AZ3454211140020140708
+
+
+
+## Set up
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+### Load packages
+library(tidyverse)
+library(sf)
+library(lubridate)
+library(raster)
+library(terra)
+# library(viridis)
+# library(scales)
+library(lwgeom)
+library(googledrive)
+# library(furrr)
+# library(sfheaders)
+library(units)
+library(rdrobust)
+library(rddensity)
+```
+
+## Datasets
+- cbi_pts_mtbs.shp: shp with location of points and composite burn index
+- trial_pts_lcmap.csv: pre-fire land cover (need to drop points that were not forest pre-fire)
+- trial_pts_dem.csv: elevation, slope, aspect (SRAI)
+- trial_pts_tpi.csv: topographic position index
+- trial_pts_treemap.csv: forest type
+- pts_dist.csv: distance between points and boundaries
+- pts_overlap_status.csv: whether or not each point overlaps with the boundary (need to drop pts that overlap with boundaries)
+- allclimatedata.csv: monthly climate data from terraclimate and day-of fire weather from gridmet
+- pts_treat_control.csv: whether each point is treated, control, or should be dropped (non-ft treatment)
+- pts_within_fire_status.csv: whether each points' pixel is fully inside fire perimeter (so can drop pixels on very edge)
+
+## Still need
+- years since treatment
+- simplified treatment type
+- stand age
+- how to summarize climate data
+
+## Prelim combination
+Output shp: E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/cbi_pts_nonclimate.shp
+Column names: c("uid", "CBI_bc", "fire_id", "fire_year", "year_prior", "elevation", "slope", "aspect_srai", "tpi", "landcover", "lc_type", "forest_type", "forest_type_gen", "dist_bound", "overlap_bound", "category", "geometry", "dist_bound_tc")
+```{r}
+### open data layers
+
+########################
+### TOPOGRAPHY
+########################
+### open topography
+dem <- read.csv("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/trial_pts_dem.csv")
+tpi <- read.csv("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/trial_pts_tpi.csv")
+
+### simplify
+dem <- dem %>% 
+  dplyr::select(uid, elevation, slope, aspect_srai)
+tpi <- tpi %>% 
+  dplyr::select(uid, tpi)
+
+### combine
+topog <- merge(x = dem,
+               y = tpi,
+               by = "uid")
+
+### clean up
+rm(dem, tpi)
+gc()
+
+########################
+### LAND COVER
+########################
+### open land cover
+lcmap <- read.csv("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/trial_pts_lcmap.csv")
+treemap <- read.csv("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/trial_pts_treemap.csv")
+
+### simplify
+lcmap <- lcmap %>% 
+  dplyr::select(uid, landcover, lc_type)
+treemap <- treemap %>% 
+  dplyr::select(uid, forest_type, forest_type_gen)
+
+### combine
+landcover <- merge(x = lcmap,
+                   y = treemap,
+                   by = "uid",
+                   all.x = TRUE)
+
+### clean up
+rm(lcmap, treemap)
+gc()
+
+########################
+### DIST TO BOUNDARIES
+########################
+### open layers
+dist_bound <- read.csv("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/pts_dist.csv")
+overlap_status <- read.csv("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/pts_overlap_status.csv")
+
+### simplify
+dist_bound <- dist_bound %>% 
+  dplyr::select(uid, dist_bound)
+overlap_status <- overlap_status %>% 
+  dplyr::select(uid, overlap_bound)
+
+### combine
+rd_distance <- merge(x = dist_bound,
+                     y = overlap_status,
+                     by = "uid")
+
+### clean up
+rm(dist_bound, overlap_status)
+gc()
+
+########################
+### TREATMENT STATUS
+########################
+treat_status <- read.csv("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/pts_treat_control.csv")
+
+########################
+### LOCATED ENTIRELY WITHIN FIRE
+########################
+inside_fire <- read.csv("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/pts_within_fire_status.csv")
+
+########################
+### COMBINE THE ABOVE
+########################
+### topography and landcover
+topo_lc <- merge(x = topog,
+                 y = landcover,
+                 by = "uid")
+rm(topog, landcover)
+gc()
+
+### add in dist to boundaries
+topo_lc_rd <- merge(x = topo_lc,
+                    y = rd_distance,
+                    by = "uid")
+rm(topo_lc, rd_distance)
+gc()
+
+### add in treatment status
+tlr_status <- merge(x = topo_lc_rd,
+                    y = treat_status,
+                    by = "uid")
+rm(topo_lc_rd, treat_status)
+gc()
+
+### add in edge of fire status
+tlr_status_inside <- merge(x = tlr_status,
+                           y = inside_fire,
+                           by = "uid")
+rm(tlr_status, inside_fire)
+gc()
+
+########################
+### PTS with SHP
+########################
+### open shp
+pts <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/cbi_pts_mtbs.shp")
+
+### reorder cols
+pts <- pts %>%
+  dplyr::select(uid, CBI_bc, fire_id, fire_year, year_prior, geometry)
+
+### merge in
+pts_dat <- merge(x = pts,
+                 y = tlr_status_inside,
+                 by = "uid")
+
+### update distance to border based on treatment/control
+pts_dat <- pts_dat %>%
+  mutate(dist_bound_tc = ifelse(category == "control",
+                                dist_bound*(-1),
+                                dist_bound))
+
+### clean up
+rm(tlr_status_inside, pts)
+gc()
+```
+### Subset to valid points
+Keep the following points: 
+- lc_type == "treecover"
+- category %in% c("treated", "control")
+- overlap_bound == "nonoverlap"
+```{r}
+### subset pts
+pts_dat_use <- pts_dat %>%
+  filter(lc_type == "treecover") %>%  ## 316535 points are not forest
+  filter(category %in% c("treated", "control")) %>% ## 14027 in "drop" category
+  filter(overlap_bound == "nonoverlap") %>% ## 21474 overlapping boundaries
+  filter(in_fire == "inside") ## 22999 points' pixels overlap the fire perimeter
+
+### write out 
+st_write(pts_dat_use,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/cbi_pts_nonclimate_use.shp")
+
+### make csv
+st_geometry(pts_dat_use) <- NULL
+
+### write out
+write_csv(pts_dat_use,
+          "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/cbi_pts_nonclimate_use.csv")
+```
+
+## Preliminary RDD
+```{r}
+### open data
+pts_dat_use <- read.csv("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/cbi_pts_nonclimate_use.csv")
+
+### summarize for each fire
+table(pts_dat_use$fire_id, pts_dat_use$category)
+
+### no valid points in CA3312011695319931027
+```
+
+### Try with the four fires together
+```{r}
+### subset
+pts_use <- pts_dat_use %>%
+  filter(!fire_id == "CA3312011695319931027")
+
+### clean up
+rm(pts_dat_use)
+gc()
+
+# ### fix colnames
+# colnames(pts_use) <- c("uid", "CBI_bc", "fire_id", "fire_year", "year_prior", 
+#                        "elevation", "slope", "aspect_srai", "tpi", "landcover", 
+#                        "lc_type", "forest_type", "forest_type_gen", "dist_bound", 
+#                        "overlap_bound", "category", "dist_bound_tc")
+```
+
+#### look at covariates
+```{r}
+### make sure category works
+pts_use %>% 
+  ggplot() +
+  geom_point(aes(x = dist_bound_tc,
+                 y = category)) +
+  geom_vline(xintercept = 0, 
+             color = "red", 
+             linetype = 4)
+
+### fire severity
+pts_use %>% 
+  ggplot() +
+  geom_point(aes(x = dist_bound_tc,
+                 y = CBI_bc)) +
+  geom_vline(xintercept = 0, 
+             color = "red", 
+             linetype = 4) +
+  xlab("Distance to the boundary (m)") +
+  ylab("Composite burn index") +
+  theme_bw() +
+  theme(axis.text = element_text(size = 13),
+        axis.title = element_text(size = 13)) +
+  xlim(-500, 300) +
+  NULL
+ggsave("trial_fire_cbi_plot.png")
+
+### elev
+pts_use %>% 
+  ggplot() +
+  geom_point(aes(x = dist_bound_tc,
+                 y = elevation)) +
+  geom_vline(xintercept = 0, 
+             color = "red", 
+             linetype = 4) +
+  xlab("Distance to the boundary (m)") +
+  ylab("Elevation") +
+  theme_bw() +
+  theme(axis.text = element_text(size = 13),
+        axis.title = element_text(size = 13)) +
+  xlim(-500, 300) +
+  NULL
+ggsave("trial_fire_elev_plot.png")
+
+### slope
+pts_use %>% 
+  ggplot() +
+  geom_point(aes(x = dist_bound_tc,
+                 y = slope)) +
+  geom_vline(xintercept = 0, 
+             color = "red", 
+             linetype = 4) +
+  xlab("Distance to the boundary (m)") +
+  ylab("Slope") +
+  theme_bw() +
+  theme(axis.text = element_text(size = 13),
+        axis.title = element_text(size = 13)) +
+  xlim(-500, 300) +
+  NULL
+ggsave("trial_fire_slope_plot.png")
+
+### aspect
+pts_use %>% 
+  ggplot() +
+  geom_point(aes(x = dist_bound_tc,
+                 y = aspect_srai)) +
+  geom_vline(xintercept = 0, 
+             color = "red", 
+             linetype = 4) +
+  xlab("Distance to the boundary (m)") +
+  ylab("Aspect (SRAI)") +
+  theme_bw() +
+  theme(axis.text = element_text(size = 13),
+        axis.title = element_text(size = 13)) +
+  xlim(-500, 300) +
+  NULL
+ggsave("trial_fire_aspect_plot.png")
+
+### tpi
+pts_use %>% 
+  ggplot() +
+  geom_point(aes(x = dist_bound_tc,
+                 y = tpi)) +
+  geom_vline(xintercept = 0, 
+             color = "red", 
+             linetype = 4) +
+  xlab("Distance to the boundary (m)") +
+  ylab("Topographic position index") +
+  theme_bw() +
+  theme(axis.text = element_text(size = 13),
+        axis.title = element_text(size = 13)) +
+  xlim(-500, 300) +
+  NULL
+ggsave("trial_fire_aspect_plot.png")
+```
+#### plot with mean value per distance
+```{r}
+### round distance
+pts_use_round <- pts_use %>%
+  mutate(dist_bound_tc_r = round(dist_bound_tc, 0))
+
+### summarize
+pts_use_round <- pts_use_round %>%
+  group_by(dist_bound_tc_r) %>%
+  summarise(cbi = mean(CBI_bc),
+            elev = mean(elevation),
+            slope = mean(slope),
+            aspect = mean(aspect_srai),
+            tpi = mean(tpi))
+
+### tpi
+pts_use_round %>% 
+  ggplot() +
+  geom_point(aes(x = dist_bound_tc_r,
+                 y = tpi)) +
+  geom_vline(xintercept = 0, 
+             color = "red", 
+             linetype = 4) +
+  xlab("Distance to the boundary (m)") +
+  ylab("Topographic position index") +
+  theme_bw() +
+  theme(axis.text = element_text(size = 13),
+        axis.title = element_text(size = 13)) +
+  xlim(-500, 300) +
+  NULL
+
+### elevation
+pts_use_round %>% 
+  ggplot() +
+  geom_point(aes(x = dist_bound_tc_r,
+                 y = elev)) +
+  geom_vline(xintercept = 0, 
+             color = "red", 
+             linetype = 4) +
+  xlab("Distance to the boundary (m)") +
+  ylab("Elevation (m)") +
+  theme_bw() +
+  theme(axis.text = element_text(size = 13),
+        axis.title = element_text(size = 13)) +
+  xlim(-500, 300) +
+  NULL
+
+### fire severity
+pts_use_round %>% 
+  ggplot() +
+  geom_point(aes(x = dist_bound_tc_r,
+                 y = cbi)) +
+  geom_vline(xintercept = 0, 
+             color = "red", 
+             linetype = 4) +
+  xlab("Distance to the boundary (m)") +
+  ylab("Composite burn index") +
+  theme_bw() +
+  theme(axis.text = element_text(size = 13),
+        axis.title = element_text(size = 13)) +
+  xlim(-500, 300) +
+  NULL
+
+### slope
+pts_use_round %>% 
+  ggplot() +
+  geom_point(aes(x = dist_bound_tc_r,
+                 y = slope)) +
+  geom_vline(xintercept = 0, 
+             color = "red", 
+             linetype = 4) +
+  xlab("Distance to the boundary (m)") +
+  ylab("Slope") +
+  theme_bw() +
+  theme(axis.text = element_text(size = 13),
+        axis.title = element_text(size = 13)) +
+  xlim(-500, 300) +
+  ylim(0, 10) +
+  NULL
+
+### aspect
+pts_use_round %>% 
+  ggplot() +
+  geom_point(aes(x = dist_bound_tc_r,
+                 y = aspect)) +
+  geom_vline(xintercept = 0, 
+             color = "red", 
+             linetype = 4) +
+  xlab("Distance to the boundary (m)") +
+  ylab("Aspect") +
+  theme_bw() +
+  theme(axis.text = element_text(size = 13),
+        axis.title = element_text(size = 13)) +
+  xlim(-500, 300) +
+  NULL
+```
+#### rd density
+```{r}
+### check for elevation
+summary(rdrobust(pts_use$elevation, pts_use$dist_bound_tc, all = TRUE))
+
+### plots
+
+### elevation
+rdplot(pts_use$elevation, 
+       pts_use$dist_bound_tc,
+       x.lim = c(-700, 500),
+       x.lab = "Distance to the boundary (m)",
+       y.lab = "Elevation (m)", 
+       title = "")
+
+### tpi
+rdplot(pts_use$tpi, 
+       pts_use$dist_bound_tc,
+       x.lim = c(-700, 500),
+       x.lab = "Distance to the boundary (m)",
+       y.lab = "Topographic position index", 
+       title = "")
+
+### aspect
+rdplot(pts_use$aspect_srai, 
+       pts_use$dist_bound_tc,
+       x.lim = c(-700, 500),
+       x.lab = "Distance to the boundary (m)",
+       y.lab = "Aspect (SRAI)", 
+       title = "")
+
+### slope
+rdplot(pts_use$slope, 
+       pts_use$dist_bound_tc,
+       x.lim = c(-700, 500),
+       x.lab = "Distance to the boundary (m)",
+       y.lab = "Slope", 
+       title = "")
+```
+
+#### run rdrobust for covariates
+```{r}
+### elevation
+summary(rdrobust(pts_use$elevation,
+                 pts_use$dist_bound_tc,
+                 all = TRUE))
+
+### slope
+summary(rdrobust(pts_use$slope,
+                 pts_use$dist_bound_tc,
+                 all = TRUE))
+
+### aspect
+summary(rdrobust(pts_use$aspect_srai,
+                 pts_use$dist_bound_tc,
+                 all = TRUE))
+
+### tpi
+summary(rdrobust(pts_use$tpi,
+                 pts_use$dist_bound_tc,
+                 all = TRUE))
+```
+
+
+#### try naive approach
+```{r}
+### use all defaults
+rdd_test <- rdrobust(y = pts_use$CBI_bc,
+                     x = pts_use$dist_bound_tc,
+                     c = 0,
+                     all = TRUE)
+summary(rdd_test)
+
+### plot it
+rdplot(pts_use$CBI_bc, 
+       pts_use$dist_bound_tc, 
+       x.lim = c(-700, 500),
+       x.label = "Distance to boundary (m)",
+       y.label = "Composite burn index",
+       title = "RDD estimate")
+
+### check for placebo cutoff
+summary(rdrobust(pts_use$CBI_bc,
+                 pts_use$dist_bound_tc,
+                 c = -100,
+                 all = TRUE))
+
+### add covariates
+rdd_test <- rdrobust(y = pts_use$CBI_bc,
+                     x = pts_use$dist_bound_tc,
+                     covs = pts_use$elevation + pts_use$slope +
+                       pts_use$aspect_srai + pts_use$tpi)
+summary(rdd_test)
+rdplot(pts_use$CBI_bc, 
+       pts_use$dist_bound_tc, 
+       covs = pts_use$elevation + pts_use$slope +
+         pts_use$aspect_srai + pts_use$tpi,
+       x.lim = c(-700, 500),
+       x.label = "Distance to boundary (m)",
+       y.label = "COmposite burn index",
+       title = "RDD estimate")
+
+### too big to plot
+```
+
+## Add in climate data
+- allclimatedata.csv: monthly climate data from terraclimate and day-of fire weather from gridmet
+```{r}
+### open climate data
+clim <- read.csv("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/allclimatedata.csv")
+
+### restrict to day of fire weather
+fw <- clim %>%
+  dplyr::select(uid, bi, erc, rmax, rmin, sph, tmmn, tmmx, vpd)
+
+### convert units
+fw <- fw %>%
+  ### tmmn and tmmx are in kelvin --> celsius
+  mutate(tmmn = tmmn - 273.15,
+         tmmx = tmmx - 273.15)
+
+### combine with the rest of the data
+pts_use_fw <- merge(x = pts_use,
+                    y = fw,
+                    by = "uid",
+                    all.x = TRUE)
+
+### clean
+rm(fw, pts_use)
+gc()
+```
+
+#### run rdrobust for fire weather
+```{r}
+### burn index
+rdplot(pts_use_fw$bi, 
+       pts_use_fw$dist_bound_tc,
+       x.lim = c(-700, 500),
+       x.lab = "Distance to the boundary (m)",
+       y.lab = "Burn index", 
+       title = "")
+
+### energy release component
+rdplot(pts_use_fw$erc, 
+       pts_use_fw$dist_bound_tc,
+       x.lim = c(-700, 500),
+       x.lab = "Distance to the boundary (m)",
+       y.lab = "Energy release component", 
+       title = "")
+
+### rmax
+rdplot(pts_use_fw$rmax, 
+       pts_use_fw$dist_bound_tc,
+       x.lim = c(-700, 500),
+       x.lab = "Distance to the boundary (m)",
+       y.lab = "Maximum relative humidity", 
+       title = "")
+
+### rmin
+rdplot(pts_use_fw$rmin, 
+       pts_use_fw$dist_bound_tc,
+       x.lim = c(-100, 100),
+       x.lab = "Distance to the boundary (m)",
+       y.lab = "Minimum relative humidity", 
+       title = "")
+
+### sph
+rdplot(pts_use_fw$sph, 
+       pts_use_fw$dist_bound_tc,
+       x.lim = c(-100, 100),
+       x.lab = "Distance to the boundary (m)",
+       y.lab = "Specific humidity", 
+       title = "")
+
+### tmmn
+rdplot(pts_use_fw$tmmn, 
+       pts_use_fw$dist_bound_tc,
+       x.lim = c(-100, 100),
+       x.lab = "Distance to the boundary (m)",
+       y.lab = "Minimum temperature", 
+       title = "")
+
+### tmmx
+rdplot(pts_use_fw$tmmx, 
+       pts_use_fw$dist_bound_tc,
+       x.lim = c(-100, 100),
+       x.lab = "Distance to the boundary (m)",
+       y.lab = "Maximum temperature", 
+       title = "")
+
+### vpd
+rdplot(pts_use_fw$vpd, 
+       pts_use_fw$dist_bound_tc,
+       x.lim = c(-100, 100),
+       x.lab = "Distance to the boundary (m)",
+       y.lab = "Vapor pressure deficit", 
+       title = "")
+```
+#### rd test with fire weather
+```{r}
+### drop points with missing values
+pts_use_fw <- pts_use_fw[complete.cases(pts_use_fw), ]
+
+### check correlations
+
+### make function
+cor.prob <- function (X, dfr = nrow(X) - 2) {
+  R <- cor(X, use="pairwise.complete.obs")
+  above <- row(R) < col(R)
+  r2 <- R[above]^2
+  Fstat <- r2 * dfr/(1 - r2)
+  R[above] <- 1 - pf(Fstat, 1, dfr)
+  R[row(R) == col(R)] <- NA
+  R
+}
+flattenSquareMatrix <- function(m) {
+  if( (class(m) != "matrix") | (nrow(m) != ncol(m))) stop("Must be a square matrix.") 
+  if(!identical(rownames(m), colnames(m))) stop("Row and column names must be equal.")
+  ut <- upper.tri(m)
+  data.frame(i = rownames(m)[row(m)[ut]],
+             j = rownames(m)[col(m)[ut]],
+             cor=t(m)[ut],
+             p=m[ut])
+}
+
+### cor cols
+corcols <- pts_use_fw[, c(6:9, 19:26)]
+
+### check correlations
+cor_table <- flattenSquareMatrix(cor.prob(corcols))
+cor_table <- cor(pts_use_fw[, c(6:9, 19:26)])
+
+### add covariates
+summary(rdrobust(y = pts_use_fw$CBI_bc,
+                 x = pts_use_fw$dist_bound_tc,
+                 covs = pts_use_fw$elevation + pts_use_fw$slope +
+                   pts_use_fw$aspect_srai + pts_use_fw$tpi +
+                   pts_use_fw$bi + pts_use_fw$erc +
+                   pts_use_fw$rmax + pts_use_fw$rmin +
+                   pts_use_fw$sph + pts_use_fw$tmmn +
+                   pts_use_fw$tmmx + pts_use_fw$vpd))
+```
+
+### glm with fire weather
+```{r}
+### open package
+library(lme4)
+
+### make treatment 0/1
+pts_use_fw <- pts_use_fw %>%
+  mutate(treat_stat = ifelse(category == "treated", 1, 0))
+
+### convert factor columns
+factor_cols <- c("uid", "treat_stat", "fire_id")
+pts_use_fw <- pts_use_fw %>%
+  mutate_each_(funs(factor(.)),
+               factor_cols)
+
+### convert elev to m
+pts_use_fw <- pts_use_fw %>%
+  mutate(elev_m = elevation/1000)
+
+### run with random effect for fire
+glm_fit <- glmer(CBI_bc ~ treat_stat + elev_m + slope + aspect_srai +
+                   tpi + sph + vpd + (1|fire_id),
+                 data = pts_use_fw)
+model_summ <- summary(glm_fit)
+model_coeff <- as.data.frame(model_summ$coefficients)
+
+### run without random effect for fire
+glm_fit_no_re <- glm(CBI_bc ~ treat_stat + elev_m + slope + aspect_srai +
+                       tpi + sph + vpd,
+                     data = pts_use_fw)
+summary(glm_fit_no_re)
+```
+
+
+

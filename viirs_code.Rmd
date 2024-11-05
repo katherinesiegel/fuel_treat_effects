@@ -1,0 +1,3054 @@
+---
+title: "viirs"
+output: html_document
+date: "2023-12-13"
+---
+
+## Description
+Gets VIIRS detections from GEE, intersects them with the fire perimeters, then rasterizes them. In the rasterizing process, the value of the pixel is equal to the "day" of the fire: a value of 1 indicates that the pixel burned on the day the fire ignited, while a value of 10 would mean that the pixel burned on the 10th day of the fire.
+
+## Set up
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+### Load packages
+library(tidyverse)
+library(sf)
+library(lubridate)
+library(raster)
+library(terra)
+library(stars)
+# library(viridis)
+# library(scales)
+library(lwgeom)
+library(googledrive)
+# library(furrr)
+# library(sfheaders)
+library(units)
+library(stringr)
+```
+
+## Notes:
+- only include fires with > 2 VIIRS detections  
+- VIIRS only operates 2012-present, so drops fires before 2012  
+- 53 fires from 2012 onward have no VIIRS detections (3 are MTBS fires, the rest are firedpy)
+
+## VIIRS
+Only available from January 2012 onward
+- some fires don't have VIIRS data even though they are in the right timespan
+```{r}
+### open western US boundaries
+w_bound <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/west_states.shp")
+
+### open VIIRS data
+viirs <- st_read("viirs/fire_nrt_J1V-C2_406378.shp") %>%
+  st_transform(., 6350) # 804613 pts
+
+# ### open trial pts
+# trial_pts <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/cbi_pts_mtbs.shp")
+
+### open mtbs perimeters and subset to fires in trial pts
+# mt <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/mtbs_gee.shp") %>%
+#   filter(., Fire_ID %in% trial_pts$fire_id) 
+mt <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/mtbs_gee.shp") %>%
+  filter(Fire_Year %in% c("2019", "2020", "2021"))
+
+# ### clean up
+# rm(trial_pts)
+
+# ### make year column for VIIRS
+# viirs <- viirs %>%
+#   mutate(year = year(ACQ_DATE))
+
+### get a random fire from 2020
+mt <- mt %>% filter(Fire_ID == "CA3966012280920200817")
+st_write(mt, "test_fire_viirs.shp")
+
+### intersect
+viirs_sub <- st_intersection(viirs, mt)
+
+### write out
+st_write(viirs_sub, 
+         "E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_mtbs_2019_2021.shp")
+```
+
+#### viirs date range
+Most of the fires and burned fuel treatments are within VIIRS's date range (584 out of 785 fires; 16642 out of 21093 fuel treatment footprints). Proposed approach: run analysis for the post-VIIRS fires, then also run an analysis for all the fires and fuel treatments that just uses fire weather on the ignition date rather than day-of-burn
+```{r}
+### open fire perimeters with fuel reduction treatments
+fires_hfr <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fires_haz_ft.shp")
+
+### Open fuel treatments with >= 900 m2 (one landsat pixel) of forest pre-fire
+burned_ft_forest <- read.csv("burned_fts_forested.csv")
+
+### open fuel treatment polygons
+burned_ft <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/all_burned_fuel_treats_year_updated_polygons_fireID.shp") %>%
+  filter(., ft_id %in% burned_ft_forest$ft_id)
+
+### Drop fires without forested fuel treatments
+fires_hfr <- fires_hfr %>%
+  filter(Fire_ID %in% burned_ft$frst_fr_d)
+
+### how many were 2012 or later (VIIRS data)
+fires_2012 <- fires_hfr %>%
+  filter(Fire_Year > 2011) ## 584 fires
+
+### how many fuel treatments does this translate to?
+burned_ft_2012 <- burned_ft %>%
+  mutate(fire_ig_date = as.Date(fr_g_dt)) %>%
+  filter(fire_ig_date > "2011-12-31")
+### 19642 fuel treatments
+```
+
+#### combine fires for viirs
+Want annual MTBS and FiredPy perimeters to filter with VIIRS in GEE and then download VIIRS
+```{r}
+### open fires
+mt <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/mtbs_gee.shp") %>%
+  dplyr::select(., -Incid_Type)
+fp <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/firedpy_gee.shp")
+
+### combine
+mt_fp <- rbind(mt, fp)
+
+### write out
+st_write(mt_fp,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/allfires_gee.shp")
+```
+
+#### intersect annual viirs with fires for that year
+```{r}
+### open fires
+mt_fp <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/allfires_gee.shp")
+
+### open viirs
+viirs <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/fire_archive_SV-C2_407891.shp") %>%
+  st_transform(., 6350) # 804613 pts
+
+### what year is this viirs data?
+range(viirs$ACQ_DATE)
+### 2012
+
+### subset fires
+fires_2012 <- mt_fp %>%
+  filter(Fire_Year == 2012)
+
+### intersect
+viirs_2012 <- st_intersection(viirs, fires_2012)
+
+### write out
+st_write(viirs_2012, 
+         "E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_allfires_2012.shp")
+
+### open VIIRS data 2019-2021 to add firedpy
+viirs_2019 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/fire_nrt_J1V-C2_406378.shp") %>%
+  st_transform(., 6350) # 804613 pts
+
+### subset fires
+fires_2019 <- mt_fp %>%
+  filter(Fire_Year %in% c(2019, 2020, 2021))
+
+### add column for fire source, restrict to firedpy
+fires_2019 <- fires_2019 %>%
+  mutate(fire_source = nchar(Fire_ID)) %>%
+  filter(fire_source < 20)
+
+### intersect
+viirs_2019 <- st_intersection(viirs_2019, fires_2019)
+
+### write out
+st_write(viirs_2019, 
+         "E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_firedpy_2019_2021.shp")
+
+### next batch
+
+### open viirs
+viirs <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/fire_archive_SV-C2_407892.shp") %>%
+  st_transform(., 6350) # 804613 pts
+
+### what year is this viirs data?
+range(viirs$ACQ_DATE)
+### 2013
+
+### subset fires
+fires_2013 <- mt_fp %>%
+  filter(Fire_Year == 2013)
+
+### intersect
+viirs_2013 <- st_intersection(viirs, fires_2013)
+
+### write out
+st_write(viirs_2013, 
+         "E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_allfires_2013.shp")
+
+### next batch
+
+### open viirs
+viirs <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/fire_archive_SV-C2_407893.shp") %>%
+  st_transform(., 6350) # 804613 pts
+
+### what year is this viirs data?
+range(viirs$ACQ_DATE)
+### 2014
+
+### subset fires
+fires_2014 <- mt_fp %>%
+  filter(Fire_Year == 2014)
+
+### intersect
+viirs_2014 <- st_intersection(viirs, fires_2014)
+
+### write out
+st_write(viirs_2014, 
+         "E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_allfires_2014.shp")
+
+### next batch
+
+### open viirs
+viirs <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/fire_archive_SV-C2_407894.shp") %>%
+  st_transform(., 6350) # 804613 pts
+
+### what year is this viirs data?
+range(viirs$ACQ_DATE)
+### 2015
+
+### subset fires
+fires_2015 <- mt_fp %>%
+  filter(Fire_Year == 2015)
+
+### intersect
+viirs_2015 <- st_intersection(viirs, fires_2015)
+
+### write out
+st_write(viirs_2015, 
+         "E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_allfires_2015.shp")
+
+### next batch
+
+### open viirs
+viirs <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/fire_archive_SV-C2_407895.shp") %>%
+  st_transform(., 6350) # 804613 pts
+
+### what year is this viirs data?
+range(viirs$ACQ_DATE)
+### 2016
+
+### subset fires
+fires_2016 <- mt_fp %>%
+  filter(Fire_Year == 2016)
+
+### intersect
+viirs_2016 <- st_intersection(viirs, fires_2016)
+
+### write out
+st_write(viirs_2016, 
+         "E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_allfires_2016.shp")
+rm(fires_2016, viirs_2016)
+
+### next batch
+
+### open viirs
+viirs <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/fire_archive_SV-C2_407896.shp") %>%
+  st_transform(., 6350) # 804613 pts
+
+### what year is this viirs data?
+range(viirs$ACQ_DATE)
+### 2017
+
+### subset fires
+fires_2017 <- mt_fp %>%
+  filter(Fire_Year == 2017)
+
+### intersect
+viirs_2017 <- st_intersection(viirs, fires_2017)
+
+### write out
+st_write(viirs_2017, 
+         "E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_allfires_2017.shp")
+rm(fires_2017, viirs_2017)
+
+### next batch
+
+### open viirs
+viirs <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/fire_archive_SV-C2_407897.shp") %>%
+  st_transform(., 6350) # 804613 pts
+
+### what year is this viirs data?
+range(viirs$ACQ_DATE)
+### 2018
+
+### subset fires
+fires_2018 <- mt_fp %>%
+  filter(Fire_Year == 2018)
+
+### intersect
+viirs_2018 <- st_intersection(viirs, fires_2018)
+
+### write out
+st_write(viirs_2018, 
+         "E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_allfires_2018.shp")
+rm(fires_2018, viirs_2018)
+
+### next batch
+
+### open viirs
+viirs <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/fire_archive_SV-C2_407898.shp") %>%
+  st_transform(., 6350) # 804613 pts
+
+### what year is this viirs data?
+range(viirs$ACQ_DATE)
+### 2019
+
+### subset fires
+fires_2019 <- mt_fp %>%
+  filter(Fire_Year == 2019)
+
+### intersect
+viirs_2019 <- st_intersection(viirs, fires_2019)
+
+### write out
+st_write(viirs_2019, 
+         "E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_allfires_2019.shp")
+rm(fires_2019, viirs_2019)
+
+### next batch
+
+### open viirs
+viirs <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/fire_archive_SV-C2_407921.shp") %>%
+  st_transform(., 6350) # 804613 pts
+
+### what year is this viirs data?
+range(viirs$ACQ_DATE)
+### 2020
+
+### subset fires
+fires_2020 <- mt_fp %>%
+  filter(Fire_Year == 2020)
+
+### intersect
+viirs_2020 <- st_intersection(viirs, fires_2020)
+
+### write out
+st_write(viirs_2020, 
+         "E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_allfires_2020.shp")
+rm(fires_2020, viirs_2020)
+```
+
+#### play with viirs for one year
+```{r}
+### open viirs for 1 year
+viirs_2012 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_allfires_2012.shp")
+
+### make column for join lat/lon
+viirs_2012 <- viirs_2012 %>%
+  mutate(lat_lon = paste0(LATITUDE, "_",
+                          LONGITUDE))
+
+### are any of these points repeated? (= multiple viirs detections for a single point)
+viirs_2012_unique <- viirs_2012 
+st_geometry(viirs_2012_unique) <- NULL
+viirs_2012_rep <- viirs_2012_unique %>%
+  group_by(lat_lon) %>%
+  summarise(n_occur = n()) %>%
+  filter(n_occur > 1)
+
+### subset to these points
+viirs_2012_dups <- viirs_2012 %>%
+  filter(lat_lon %in% viirs_2012_rep$lat_lon)
+unique(viirs_2012_dups$Fire_ID)
+
+### are these the same acquisition date and overlapping MTBS and firedpy?
+st_geometry(viirs_2012_dups) <- NULL
+dups_acq <- viirs_2012_dups %>%
+  group_by(lat_lon, ACQ_DATE, ACQ_TIME) %>%
+  summarise(n_occur = n())
+
+### MT4740911286820120712 overlaps with 259502, 257261, and 259058
+### MT4760011366720120728 overlaps with 260455
+
+### all the repeats are the same VIIRS records for overlapping fires
+
+### rows to drop
+viirs_2012_dups <- viirs_2012_dups %>%
+  mutate(fire_source = nchar(Fire_ID)) %>%
+  filter(fire_source < 20)
+
+### make fire id latlon col
+viirs_2012_dups <- viirs_2012_dups %>%
+  mutate(drop_col = paste0(Fire_ID, "_", lat_lon))
+viirs_2012 <- viirs_2012 %>%
+  mutate(drop_col = paste0(Fire_ID, "_", lat_lon))
+
+### remove these dups from viirs_2012
+viirs_2012 <- viirs_2012 %>%
+  filter(!drop_col %in% viirs_2012_dups$drop_col)
+
+## now all rows are unique
+```
+
+#### figure out how many fires don't have VIIRS data
+```{r}
+### open fires
+mt_fp <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/allfires_gee.shp") %>%
+  filter(., Fire_Year > 2011)
+
+### split fires
+mt_fp_split <- split(mt_fp, mt_fp$Fire_Year)
+
+### 2012
+### open viirs data 
+viirs_2012 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_allfires_2012.shp") 
+### figure out which fires don't have data
+fires_2012 <- mt_fp_split[[1]] %>%
+  filter(!Fire_ID %in% viirs_2012$Fire_ID)
+rm(viirs_2012)
+
+### 2013
+### open viirs data 
+viirs_2013 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_allfires_2013.shp") 
+### figure out which fires don't have data
+fires_2013 <- mt_fp_split[[2]] %>%
+  filter(!Fire_ID %in% viirs_2013$Fire_ID)  
+rm(viirs_2013)
+
+### 2014
+### open viirs data 
+viirs_2014 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_allfires_2014.shp") 
+### figure out which fires don't have data
+fires_2014 <- mt_fp_split[[3]] %>%
+  filter(!Fire_ID %in% viirs_2014$Fire_ID)  
+rm(viirs_2014)
+
+### 2015
+### open viirs data 
+viirs_2015 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_allfires_2015.shp") 
+### figure out which fires don't have data
+fires_2015 <- mt_fp_split[[4]] %>%
+  filter(!Fire_ID %in% viirs_2015$Fire_ID)  
+rm(viirs_2015)
+
+### 2016
+### open viirs data 
+viirs_2016 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_allfires_2016.shp") 
+### figure out which fires don't have data
+fires_2016 <- mt_fp_split[[5]] %>%
+  filter(!Fire_ID %in% viirs_2016$Fire_ID)  
+rm(viirs_2016)
+
+### 2017
+### open viirs data 
+viirs_2017 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_allfires_2017.shp") 
+### figure out which fires don't have data
+fires_2017 <- mt_fp_split[[6]] %>%
+  filter(!Fire_ID %in% viirs_2017$Fire_ID)  
+rm(viirs_2017)
+
+### 2018
+### open viirs data 
+viirs_2018 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_allfires_2018.shp") 
+### figure out which fires don't have data
+fires_2018 <- mt_fp_split[[7]] %>%
+  filter(!Fire_ID %in% viirs_2018$Fire_ID)  
+rm(viirs_2018)
+
+### 2019
+### open viirs data 
+viirs_2019 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_allfires_2019.shp") 
+### figure out which fires don't have data
+fires_2019 <- mt_fp_split[[8]] %>%
+  filter(!Fire_ID %in% viirs_2019$Fire_ID)  
+rm(viirs_2019)
+
+### 2020
+### open viirs data 
+viirs_2020 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_allfires_2020.shp") 
+### figure out which fires don't have data
+fires_2020 <- mt_fp_split[[9]] %>%
+  filter(!Fire_ID %in% viirs_2020$Fire_ID)  
+rm(viirs_2020)
+
+### combine 
+fire_no_viirs <- rbind(fires_2012,
+                       fires_2013,
+                       fires_2014, 
+                       fires_2015,
+                       fires_2016,
+                       fires_2017,
+                       fires_2018,
+                       fires_2019,
+                       fires_2020)
+
+### western us
+w_us <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/west_states.shp")
+
+### plot
+ggplot() +
+  geom_sf(data = w_us) +
+  geom_sf(data = fire_no_viirs,
+          aes(color = Fire_Year,
+              fill = Fire_Year)) +
+  NULL
+
+### write out these fires
+st_write(fire_no_viirs,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/fires_wo_viirs.shp")
+```
+
+#### use fires_wo_viirs to get viirs from GEE for missing fires
+```{r}
+### open annual pts from GEE
+
+### get file path/list
+viirs_files <- list.files(path = "E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_gee",
+                        pattern = "*.shp$",
+                        full.names = TRUE)
+
+### open them all
+viirs_all <- lapply(viirs_files, st_read)
+
+### combine
+viirs_all <- bind_rows(viirs_all)
+
+### add year column
+viirs_all <- viirs_all %>%
+  mutate(viirs_year = year(acq_date))
+
+### reproject
+viirs_all <- viirs_all %>%
+  st_transform(6350)
+
+### make vector of years in the data
+viirs_years <- sort(unique(viirs_all$viirs_year))
+
+### check overlaps with the fires in the correct year
+
+### make storage list
+store_viirs <- list()
+
+### loop
+for (i in 1:length(viirs_years)) {
+  
+  ### get viirs year
+  v_year <- viirs_years[i]
+  
+  ### subset viirs to that year
+  viirs_temp <- viirs_all %>%
+    filter(viirs_year == v_year)
+  
+  ### subset fires
+  fire_temp <- fire_no_viirs %>%
+    filter(Fire_Year == v_year)
+  
+  ### overlap
+  viirs_burned <- st_intersection(viirs_temp,
+                                  fire_temp)
+  
+  ### store
+  store_viirs[[i]] <- viirs_burned
+  
+}
+
+### combine
+viirs_burned_fires <- do.call(rbind, store_viirs)
+
+### write out
+st_write(viirs_burned_fires,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_gee_all_years.shp")
+
+### which fires still don't have viirs detections?
+still_no_viirs <- fire_no_viirs %>%
+  filter(!Fire_ID %in% viirs_burned_fires$Fire_ID)
+length(unique(still_no_viirs$Fire_ID))
+
+### 52 fires don't have viirs data
+table(still_no_viirs$Fire_Year)
+### it's spread out over the years
+
+### how big are these fires?
+still_no_viirs$fire_area <- st_area(still_no_viirs)
+
+### 3 are MTBS and the rest are firedpy fires
+#### AZ3156211037620190714 (2019)
+#### AZ3149011031620150322 (2015)
+#### CA3745411858420150206 (2015)
+
+### write out
+st_write(still_no_viirs,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/fires_wo_viirs_data.shp")
+
+### make csv
+st_geometry(still_no_viirs) <- NULL
+still_no_viirs <- still_no_viirs %>%
+  mutate(fire_area_m2 = as.numeric(fire_area),
+         fire_area_ha = fire_area_m2*0.0001)
+still_no_viirs <- still_no_viirs %>%
+  dplyr::select(Fire_ID, Fire_Year, fire_area_ha)
+write_csv(still_no_viirs,
+          "E:/usda_2023/usfs_fuel_treatments/western_us/fires_wo_viirs_data.csv")
+
+### learn more about the MTBS fires in this dataset
+mtbs_no_viirs <- st_read("E:/fire_sev_rdd/mtbs/mtbs_perims_DD.shp") %>%
+  filter(., Event_ID %in% still_no_viirs$Fire_ID)
+```
+#### mtbs fires missing viirs
+CA3745411858420150206: Round Fire (Ignition 2015-02-06), burned 6195 acres
+```{r ca_no_viirs, echo=FALSE, fig.cap="ca fire without viirs", out.width = '90%'}
+knitr::include_graphics("cbi_CA3745411858420150206.png")
+```
+
+AZ3149011031620150322: unnamed fire, unknown incident type (Ignition 2015-03-22), burned 1606 acres. Very low burn severity overall. Also has a weird line across the CBI estimate, doesn't seem to have much forest at present
+```{r ca_no_viirs, echo=FALSE, fig.cap="ca fire without viirs", out.width = '90%'}
+knitr::include_graphics("cbi_AZ3149011031620150322.png")
+```
+
+AZ3156211037620190714: Buffalo Corral Fire (Ignition 2019-07-14), burned 1146 acres. All burned at low severity
+```{r ca_no_viirs, echo=FALSE, fig.cap="ca fire without viirs", out.width = '90%'}
+knitr::include_graphics("cbi_AZ3156211037620190714.png")
+```
+#### firedpy fires missing viirs
+Some examples
+
+Fire 434323 (2020) in California
+```{r ca_no_viirs, echo=FALSE, fig.cap="ca fire without viirs", out.width = '90%'}
+knitr::include_graphics("cbi_434323.png")
+```
+Various fires in southern Oregon: 283829 (2013), 376398 (2017), 283854 (2013), 284007 (2013), 283896 (2013), 283888 (2013)
+```{r ca_no_viirs, echo=FALSE, fig.cap="ca fire without viirs", out.width = '90%'}
+knitr::include_graphics("cbi_283829_etal.png")
+```
+352167 (2016)
+```{r ca_no_viirs, echo=FALSE, fig.cap="ca fire without viirs", out.width = '90%'}
+knitr::include_graphics("cbi_352167.png")
+```
+### VIIRS next steps
+- open each year of VIIRS + extra viirs from gee ("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_gee_all_years.shp")
+- make buffers
+- then separate by fire ID
+- then rasterize OR just intersect sample points directly 
+--> need to figure out how to interpolate! since there are gaps between viirs detections
+
+Potential sources for interpolation methods: 
+- https://www.fs.usda.gov/pnw/pubs/journals/pnw_2023_klock001.pdf [It’s about Time: A Method for Estimating Wildfire Arrival and Weather Conditions at Field-Sampled Locations] -- made 500m grid from VIIRS point detections, used earliest detection if multiple points in the grid
+- https://doi.org/10.1038%2Fs41597-022-01343-0
+- https://www.osti.gov/pages/servlets/purl/1888101
+- https://www.publish.csiro.au/wf/pdf/WF22022 [Quantifying burned area of wildfires in the western United States from polar-orbiting and geostationary satellite active-fire detections]
+- https://doi.org/10.1186/s42408-023-00219-x
+
+```{r}
+# ### open fire perimeters
+# mt_fp <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/allfires_gee.shp")
+# 
+# ### I also want the ignition dates for these
+# ### open firedpy perimeter polygons
+# fp <- st_read("E:/fired_py_data/fired_west_events.shp") %>%
+#   filter(., id %in% mt_fp$Fire_ID) %>%
+#   dplyr::select(., Fire_ID = id, ig_date)
+# st_geometry(fp) <- NULL
+# fp$ig_date <- as.Date(fp$ig_date)
+# 
+# ### open mtbs perimeter polygons
+# mt <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/mtbs_west.shp") %>%
+#   filter(., Event_ID %in% mt_fp$Fire_ID) %>%
+#   dplyr::select(., Fire_ID = Event_ID,
+#                 ig_date = Ig_Date)
+# st_geometry(mt) <- NULL
+# 
+# ### combine fp and mt
+# mt_fp_dates <- rbind(fp, mt)
+# 
+# ### add ignition date to mt_fp
+# mt_fp <- merge(mt_fp,
+#                mt_fp_dates,
+#                by = "Fire_ID",
+#                all.x = TRUE)
+# 
+# ### write out
+# mt_fp <- st_write(mt_fp,
+#                   "E:/usda_2023/usfs_fuel_treatments/western_us/allfires_gee_igdate.shp")
+
+### open fire perimeters
+mt_fp <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/allfires_gee_igdate.shp")
+
+### make sure dates are dates
+mt_fp$ig_date <- as.Date(mt_fp$ig_date)
+
+### open viirs gee leftovers
+viirs_gee <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_gee_all_years.shp") %>%
+  st_transform(., 6350)
+
+### update columns for viirs_gee
+viirs_gee <- viirs_gee %>%
+  dplyr::select(BRIGHTNESS = bright_ti5,
+                SCAN = scan,
+                TRACK = track,
+                ACQ_DATE = acq_date,
+                ACQ_TIME = acq_time,
+                SATELLITE = satellite,
+                INSTRUMENT = instrument, 
+                CONFIDENCE = confidence,
+                VERSION = version,
+                BRIGHT_T31 = bright_ti4,
+                FRP = frp,
+                DAYNIGHT = daynight,
+                TYPE = type,
+                Fire_ID, Fire_Year, 
+                Start_Day, End_Day,
+                geometry)
+```
+
+#### viirs 2012
+```{r}
+### open viirs for 1 year
+viirs_2012 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_allfires_2012.shp") %>%
+  st_transform(., 6350)
+
+### make column for join lat/lon
+viirs_2012 <- viirs_2012 %>%
+  mutate(lat_lon = paste0(LATITUDE, "_",
+                          LONGITUDE))
+
+### are any of these points repeated? (= multiple viirs detections for a single point)
+viirs_2012_unique <- viirs_2012 
+st_geometry(viirs_2012_unique) <- NULL
+viirs_2012_rep <- viirs_2012_unique %>%
+  group_by(lat_lon) %>%
+  summarise(n_occur = n()) %>%
+  filter(n_occur > 1)
+
+### subset to these points
+viirs_2012_dups <- viirs_2012 %>%
+  filter(lat_lon %in% viirs_2012_rep$lat_lon)
+unique(viirs_2012_dups$Fire_ID)
+
+### are these the same acquisition date and overlapping MTBS and firedpy?
+st_geometry(viirs_2012_dups) <- NULL
+dups_acq <- viirs_2012_dups %>%
+  group_by(lat_lon, ACQ_DATE, ACQ_TIME) %>%
+  summarise(n_occur = n())
+
+### MT4740911286820120712 overlaps with 259502, 257261, and 259058
+### MT4760011366720120728 overlaps with 260455
+
+### all the repeats are the same VIIRS records for overlapping fires
+
+### rows to drop
+viirs_2012_dups <- viirs_2012_dups %>%
+  mutate(fire_source = nchar(Fire_ID)) %>%
+  filter(fire_source < 20)
+
+### make fire id latlon col
+viirs_2012_dups <- viirs_2012_dups %>%
+  mutate(drop_col = paste0(Fire_ID, "_", lat_lon))
+viirs_2012 <- viirs_2012 %>%
+  mutate(drop_col = paste0(Fire_ID, "_", lat_lon))
+
+### remove these dups from viirs_2012
+viirs_2012 <- viirs_2012 %>%
+  filter(!drop_col %in% viirs_2012_dups$drop_col)
+rm(viirs_2012_dups, viirs_2012_rep, viirs_2012_unique)
+
+## now all rows are unique
+
+### drop cols that aren't in gee df
+viirs_2012 <- viirs_2012 %>%
+  dplyr::select(-LATITUDE, -LONGITUDE, 
+                -lat_lon, -drop_col)
+
+### subset viirs_gee
+viirs_gee_2012 <- viirs_gee %>%
+  filter(Fire_Year == 2012)
+
+### combine
+viirs_2012_all <- rbind(viirs_2012, 
+                        viirs_gee_2012)
+
+# ### make function for square buffers
+# sq_buff <- function(x, a) {
+#   a <- sqrt(a)/2
+#   return(sf::st_buffer(x, 
+#                        dist = a, 
+#                        nQuadSegs = 1,
+#                        endCapStyle = "SQUARE"))
+# }
+
+### distance for buff
+buff_dist <- 375/2
+
+### add square buffer around all points
+viirs_2012_all <- viirs_2012_all %>%
+  sf::st_buffer(dist = buff_dist,
+                endCapStyle = "SQUARE")
+
+# ### add square buffer around all points
+# viirs_2012_all <- st_buffer(viirs_2012_all,
+#                             187.5)
+
+### split by wildfire ID
+viirs_2012_split <- split(viirs_2012_all, viirs_2012_all$Fire_ID)
+```
+
+##### rasterize: try from 1 fire
+
+- code sources:  
+
++ https://stackoverflow.com/questions/71801889/how-to-fill-in-missing-na-values-in-raster-with-terra-package  
++ https://stackoverflow.com/questions/77628082/rasterize-overlapping-sf-objects-in-r-and-specify-which-values-to-use-for-pixels/77632662#77632662 
+```{r}
+### try rasterizing for a single fire
+test <- viirs_2012_split[[7]]
+
+### extract fire id
+test_f_id <- unique(test$Fire_ID)
+
+### get test fire perimeter
+test_f_perim <- mt_fp %>%
+  filter(Fire_ID == test_f_id)
+
+### open cbi raster for that fire
+test_cbi <- raster("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_fuel_treat_mtbs/AZ3421511233820120513_CBI_bc.tif")
+target_epsg <- "+init=EPSG:6350"
+test_cbi <- projectRaster(test_cbi,
+                          crs = target_epsg)
+
+### plot
+# ggplot() +
+#   geom_sf(data = test_f_perim) +
+#   geom_stars(data = test_cbi) +
+#   geom_sf(data = test, aes(color = ACQ_DATE,
+#                            fill = ACQ_DATE)) +
+# 
+#   NULL
+
+# plot(test_cbi)
+
+### columns for raster
+test <- test %>%
+  dplyr::select(Fire_ID,
+                ACQ_DATE,
+                FRP, 
+                Fire_Year)
+
+### make numeric version of acq_date
+test <- test %>%
+  mutate(acq_date_num = as.character(ACQ_DATE))
+test <- test %>%
+  mutate(acq_date_num = str_replace_all(acq_date_num, "[[:punct:]]", ""))
+test$acq_date_num <- as.numeric(test$acq_date_num)
+
+### make day relative to ignition
+test_ignition <- min(test$acq_date_num)
+test <- test %>%
+  mutate(fire_date = acq_date_num - test_ignition + 1)
+
+# ### dimensions of cbi raster
+# dim(test_cbi)
+
+### rasterize
+# test_rast <- st_rasterize(test,
+#                           template = test_cbi)
+# no_dat_value <- -1
+# test_rast <- st_rasterize(test,
+#                           st_as_stars(st_bbox(test_f_perim),
+#                                       nx = 399,
+#                                       ny = 460))
+
+### try with terra:rasterize
+# terra_rast <- rast(test, res = 2)
+terra_rast <- rast(test_cbi)
+terra_raster <- terra::rasterize(test,
+                                 terra_rast,
+                                 "fire_date",
+                                 fun = "min",
+                                 background = NA)
+
+plot(terra_raster)
+
+### try filling gaps - used window = 9, 15, 19, 29, 41, 51, 59
+### fill it with window = 89
+fill_raster_5 <- terra::focal(x = terra_raster,
+                              w = 89,
+                              fun = mean,
+                              na.policy = "only", 
+                              na.rm = TRUE)
+plot(fill_raster_5)
+
+### write out
+terra::writeRaster(fill_raster_5,
+                   filename = "E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_rast/test_rast_viirs_8.tif")
+
+# ### crop to fire perimeter - not sure if i need to crop or not
+# fill_rast_crop <- crop(fill_raster_5,
+#                        ext(test_f_perim))
+
+```
+
+##### rasterize: formalize from 1 fire
+```{r}
+### set base values (will not change with loop)
+### 1. file path for cbi raster
+cbi_rast_path <- "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_mtbs_firedpy/"
+### 2. set EPSG
+target_epsg <- "+init=EPSG:6350"
+### 3. file path for output rasters
+output_rast_path <- "E:/usda_2023/usfs_fuel_treatments/western_us/viirs_rast_date/"
+
+### get a subset of 5 fires
+test_dfs <- viirs_2012_split[c(7:11)]
+
+### get the first one
+test <- test_dfs[[1]]
+
+### extract fire id
+test_f_id <- unique(test$Fire_ID)
+
+### get test fire perimeter
+test_f_perim <- mt_fp %>%
+  filter(Fire_ID == test_f_id)
+
+### open cbi raster for that fire
+test_cbi <- raster(file.path(paste0(cbi_rast_path, test_f_id, ".tif")))
+
+### project to correct epsg
+test_cbi <- projectRaster(test_cbi,
+                          crs = target_epsg)
+
+### columns for raster
+test <- test %>%
+  dplyr::select(Fire_ID,
+                ACQ_DATE,
+                FRP, 
+                Fire_Year)
+
+### get date of fire
+ig_date_fire <- test_f_perim$ig_date
+
+### get acquisition date relative to ignition date 
+### acq_date_ig means that the image was captured on the first day of the fire, etc...
+test <- test %>%
+  mutate(ig_date = ig_date_fire,
+         acq_date_ig = as.numeric(ACQ_DATE - ig_date_fire) + 1)
+
+### try with terra:rasterize
+### make cbi raster the right format
+terra_rast <- rast(test_cbi)
+
+### rasterize the viirs data
+terra_raster <- terra::rasterize(x = test,
+                                 y = terra_rast,
+                                 "acq_date_ig",
+                                 fun = "min",
+                                 background = NA)
+
+plot(terra_raster)
+
+### try filling gaps - used window = 9, 15, 19, 29, 41, 51, 59
+### fill it with window = 89
+fill_terra_raster <- terra::focal(x = terra_raster,
+                              w = 89,
+                              fun = mean,
+                              na.policy = "only", 
+                              na.rm = TRUE)
+plot(fill_terra_raster)
+
+### only want round numbers
+fill_terra_raster <- round(fill_terra_raster)
+
+# ### do without rounding for comparison
+# terra::writeRaster(fill_terra_raster,
+#                    filename = file.path(paste0(output_rast_path,
+#                                                test_f_id,
+#                                                "unrounded.tif")))
+
+### write out
+terra::writeRaster(fill_terra_raster,
+                   filename = file.path(paste0(output_rast_path,
+                                               test_f_id,
+                                               ".tif")))
+
+# ### crop to fire perimeter - not sure if i need to crop or not
+# fill_rast_crop <- crop(fill_raster_5,
+#                        ext(test_f_perim))
+```
+
+##### rasterize: loop for handful of fires
+```{r}
+### set base values (will not change with loop)
+### 1. file path for cbi raster
+cbi_rast_path <- "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_mtbs_firedpy/"
+### 2. set EPSG
+target_epsg <- "+init=EPSG:6350"
+### 3. file path for output rasters
+output_rast_path <- "E:/usda_2023/usfs_fuel_treatments/western_us/viirs_rast_date/"
+
+### get a subset of 5 fires
+test_dfs <- viirs_2012_split[c(7:11)]
+
+### write loop
+for (i in 1:length(test_dfs)) {
+  
+  ### print step
+  print(paste0("STEP ", i))
+  
+  ### get the first one
+  test <- test_dfs[[i]]
+  
+  ### extract fire id
+  test_f_id <- unique(test$Fire_ID)
+  
+  ### get test fire perimeter
+  test_f_perim <- mt_fp %>%
+    filter(Fire_ID == test_f_id)
+  
+  ### open cbi raster for that fire
+  test_cbi <- raster(file.path(paste0(cbi_rast_path, test_f_id, ".tif")))
+  
+  ### project to correct epsg
+  test_cbi <- projectRaster(test_cbi,
+                            crs = target_epsg)
+  
+  ### columns for raster
+  test <- test %>%
+    dplyr::select(Fire_ID,
+                  ACQ_DATE,
+                  FRP, 
+                  Fire_Year)
+  
+  ### get date of fire
+  ig_date_fire <- test_f_perim$ig_date
+  
+  ### get acquisition date relative to ignition date 
+  ### acq_date_ig means that the image was captured on the first day of the fire, etc...
+  test <- test %>%
+    mutate(ig_date = ig_date_fire,
+           acq_date_ig = as.numeric(ACQ_DATE - ig_date_fire) + 1)
+  
+  ### try with terra:rasterize
+  ### make cbi raster the right format
+  terra_rast <- rast(test_cbi)
+  
+  ### rasterize the viirs data
+  terra_raster <- terra::rasterize(x = test,
+                                   y = terra_rast,
+                                   "acq_date_ig",
+                                   fun = "min",
+                                   background = NA)
+  
+  # plot(terra_raster)
+  
+  ### try filling gaps - used window = 9, 15, 19, 29, 41, 51, 59
+  ### fill it with window = 89
+  fill_terra_raster <- terra::focal(x = terra_raster,
+                                    w = 89,
+                                    fun = mean,
+                                    na.policy = "only", 
+                                    na.rm = TRUE)
+  # plot(fill_terra_raster)
+  
+  ### only want round numbers
+  fill_terra_raster <- round(fill_terra_raster)
+  
+  ### write out
+  terra::writeRaster(fill_terra_raster,
+                     filename = file.path(paste0(output_rast_path,
+                                                 test_f_id,
+                                                 ".tif")),
+                     overwrite = TRUE)
+  
+}
+
+# ### crop to fire perimeter - not sure if i need to crop or not
+# fill_rast_crop <- crop(fill_raster_5,
+#                        ext(test_f_perim))
+```
+
+##### rasterize: 2012 loop 
+```{r}
+### set base values (will not change with loop)
+### 1. file path for cbi raster
+cbi_rast_path <- "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_mtbs_firedpy/"
+### 2. set EPSG
+target_epsg <- "+init=EPSG:6350"
+### 3. file path for output rasters
+output_rast_path <- "E:/usda_2023/usfs_fuel_treatments/western_us/viirs_rast_date/"
+
+### write loop
+for (i in 1:length(viirs_2012_split)) {
+# for (i in 22:length(viirs_2012_split)) {
+  
+  ### print step
+  print(paste0("STEP ", i))
+  
+  ### get the first one
+  test <- viirs_2012_split[[i]]
+  
+  if(nrow(test) > 2) {
+    
+    ### extract fire id
+    test_f_id <- unique(test$Fire_ID)
+    
+    ### get test fire perimeter
+    test_f_perim <- mt_fp %>%
+      filter(Fire_ID == test_f_id) %>%
+      distinct()
+    
+    ### open cbi raster for that fire
+    test_cbi <- raster(file.path(paste0(cbi_rast_path, test_f_id, ".tif")))
+    
+    ### project to correct epsg
+    test_cbi <- projectRaster(test_cbi,
+                              crs = target_epsg)
+    
+    ### columns for raster
+    test <- test %>%
+      dplyr::select(Fire_ID,
+                    ACQ_DATE,
+                    FRP, 
+                    Fire_Year)
+    
+    ### get date of fire
+    ig_date_fire <- test_f_perim$ig_date
+    
+    ### get acquisition date relative to ignition date 
+    ### acq_date_ig means that the image was captured on the first day of the fire, etc...
+    test <- test %>%
+      mutate(ig_date = ig_date_fire,
+             acq_date_ig = as.numeric(ACQ_DATE - ig_date_fire) + 1) %>%
+      
+      ### drop viirs detections from before the fire occurred
+      filter(acq_date_ig > 0)
+    
+    ### try with terra:rasterize
+    ### make cbi raster the right format
+    terra_rast <- rast(test_cbi)
+    
+    ### rasterize the viirs data
+    terra_raster <- terra::rasterize(x = test,
+                                     y = terra_rast,
+                                     "acq_date_ig",
+                                     fun = "min",
+                                     background = NA)
+    
+    # plot(terra_raster)
+    
+    ### try filling gaps - used window = 9, 15, 19, 29, 41, 51, 59
+    ### fill it with window = 89
+    fill_terra_raster <- terra::focal(x = terra_raster,
+                                      w = 89,
+                                      fun = mean,
+                                      na.policy = "only", 
+                                      na.rm = TRUE)
+    # plot(fill_terra_raster)
+    
+    ### only want round numbers
+    fill_terra_raster <- round(fill_terra_raster)
+    
+    ### write out
+    terra::writeRaster(fill_terra_raster,
+                       filename = file.path(paste0(output_rast_path,
+                                                   test_f_id,
+                                                   ".tif")),
+                       overwrite = TRUE)
+    
+  }}
+
+# ### crop to fire perimeter - not sure if i need to crop or not
+# fill_rast_crop <- crop(fill_raster_5,
+#                        ext(test_f_perim))
+```
+
+## fires with < 2 viirs detections are dropped from this
+
+#### viirs 2013
+```{r}
+### open viirs for 1 year
+viirs_2013 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_allfires_2013.shp") %>%
+  st_transform(., 6350)
+
+### make column for join lat/lon
+viirs_2013 <- viirs_2013 %>%
+  mutate(lat_lon = paste0(LATITUDE, "_",
+                          LONGITUDE))
+
+### are any of these points repeated? (= multiple viirs detections for a single point)
+viirs_2013_unique <- viirs_2013 
+st_geometry(viirs_2013_unique) <- NULL
+viirs_2013_rep <- viirs_2013_unique %>%
+  group_by(lat_lon) %>%
+  summarise(n_occur = n()) %>%
+  filter(n_occur > 1)
+
+### subset to these points
+viirs_2013_dups <- viirs_2013 %>%
+  filter(lat_lon %in% viirs_2013_rep$lat_lon)
+unique(viirs_2013_dups$Fire_ID)
+
+### no repeats
+
+### drop cols that aren't in gee df
+viirs_2013 <- viirs_2013 %>%
+  dplyr::select(-LATITUDE, -LONGITUDE, 
+                -lat_lon)
+
+### subset viirs_gee
+viirs_gee_2013 <- viirs_gee %>%
+  filter(Fire_Year == 2013)
+
+### combine
+viirs_2013_all <- rbind(viirs_2013, 
+                        viirs_gee_2013)
+
+# ### make function for square buffers
+# sq_buff <- function(x, a) {
+#   a <- sqrt(a)/2
+#   return(sf::st_buffer(x, 
+#                        dist = a, 
+#                        nQuadSegs = 1,
+#                        endCapStyle = "SQUARE"))
+# }
+
+### distance for buff
+buff_dist <- 375/2
+
+### add square buffer around all points
+viirs_2013_all <- viirs_2013_all %>%
+  sf::st_buffer(dist = buff_dist,
+                endCapStyle = "SQUARE")
+
+# ### add square buffer around all points
+# viirs_2013_all <- st_buffer(viirs_2013_all,
+#                             187.5)
+
+### split by wildfire ID
+viirs_2013_split <- split(viirs_2013_all, viirs_2013_all$Fire_ID)
+```
+
+##### rasterize 2013 
+```{r}
+### set base values (will not change with loop)
+### 1. file path for cbi raster
+cbi_rast_path <- "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_mtbs_firedpy/"
+### 2. set EPSG
+target_epsg <- "+init=EPSG:6350"
+### 3. file path for output rasters
+output_rast_path <- "E:/usda_2023/usfs_fuel_treatments/western_us/viirs_rast_date/"
+
+### write loop
+for (i in 1:length(viirs_2013_split)) {
+# for (i in 22:length(viirs_2013_split)) {
+  
+  ### print step
+  print(paste0("STEP ", i))
+  
+  ### get the first one
+  test <- viirs_2013_split[[i]]
+  
+  if(nrow(test) > 2) {
+    
+    ### extract fire id
+    test_f_id <- unique(test$Fire_ID)
+    
+    ### get test fire perimeter
+    test_f_perim <- mt_fp %>%
+      filter(Fire_ID == test_f_id) %>%
+      distinct()
+    
+    ### open cbi raster for that fire
+    test_cbi <- raster(file.path(paste0(cbi_rast_path, test_f_id, ".tif")))
+    
+    ### project to correct epsg
+    test_cbi <- projectRaster(test_cbi,
+                              crs = target_epsg)
+    
+    ### columns for raster
+    test <- test %>%
+      dplyr::select(Fire_ID,
+                    ACQ_DATE,
+                    FRP, 
+                    Fire_Year)
+    
+    ### get date of fire
+    ig_date_fire <- test_f_perim$ig_date
+    
+    ### get acquisition date relative to ignition date 
+    ### acq_date_ig means that the image was captured on the first day of the fire, etc...
+    test <- test %>%
+      mutate(ig_date = ig_date_fire,
+             acq_date_ig = as.numeric(ACQ_DATE - ig_date_fire) + 1) %>%
+      
+      ### drop viirs detections from before the fire occurred
+      filter(acq_date_ig > 0)
+    
+    ### try with terra:rasterize
+    ### make cbi raster the right format
+    terra_rast <- rast(test_cbi)
+    
+    ### rasterize the viirs data
+    terra_raster <- terra::rasterize(x = test,
+                                     y = terra_rast,
+                                     "acq_date_ig",
+                                     fun = "min",
+                                     background = NA)
+    
+    # plot(terra_raster)
+    
+    ### try filling gaps - used window = 9, 15, 19, 29, 41, 51, 59
+    ### fill it with window = 89
+    fill_terra_raster <- terra::focal(x = terra_raster,
+                                      w = 89,
+                                      fun = mean,
+                                      na.policy = "only", 
+                                      na.rm = TRUE)
+    # plot(fill_terra_raster)
+    
+    ### only want round numbers
+    fill_terra_raster <- round(fill_terra_raster)
+    
+    ### write out
+    terra::writeRaster(fill_terra_raster,
+                       filename = file.path(paste0(output_rast_path,
+                                                   test_f_id,
+                                                   ".tif")),
+                       overwrite = TRUE)
+    
+  }}
+```
+
+#### viirs 2014
+```{r}
+### open viirs for 1 year
+viirs_2014 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_allfires_2014.shp") %>%
+  st_transform(., 6350)
+
+### make column for join lat/lon
+viirs_2014 <- viirs_2014 %>%
+  mutate(lat_lon = paste0(LATITUDE, "_",
+                          LONGITUDE))
+
+### are any of these points repeated? (= multiple viirs detections for a single point)
+viirs_2014_unique <- viirs_2014 
+st_geometry(viirs_2014_unique) <- NULL
+viirs_2014_rep <- viirs_2014_unique %>%
+  group_by(lat_lon) %>%
+  summarise(n_occur = n()) %>%
+  filter(n_occur > 1)
+
+### subset to these points
+viirs_2014_dups <- viirs_2014 %>%
+  filter(lat_lon %in% viirs_2014_rep$lat_lon)
+unique(viirs_2014_dups$Fire_ID)
+
+### no repeats
+
+### drop cols that aren't in gee df
+viirs_2014 <- viirs_2014 %>%
+  dplyr::select(-LATITUDE, -LONGITUDE, 
+                -lat_lon)
+
+### subset viirs_gee
+viirs_gee_2014 <- viirs_gee %>%
+  filter(Fire_Year == 2014)
+
+### combine
+viirs_2014_all <- rbind(viirs_2014, 
+                        viirs_gee_2014)
+
+# ### make function for square buffers
+# sq_buff <- function(x, a) {
+#   a <- sqrt(a)/2
+#   return(sf::st_buffer(x, 
+#                        dist = a, 
+#                        nQuadSegs = 1,
+#                        endCapStyle = "SQUARE"))
+# }
+
+### distance for buff
+buff_dist <- 375/2
+
+### add square buffer around all points
+viirs_2014_all <- viirs_2014_all %>%
+  sf::st_buffer(dist = buff_dist,
+                endCapStyle = "SQUARE")
+
+# ### add square buffer around all points
+# viirs_2014_all <- st_buffer(viirs_2014_all,
+#                             187.5)
+
+### split by wildfire ID
+viirs_2014_split <- split(viirs_2014_all, viirs_2014_all$Fire_ID)
+
+### clean up
+rm(viirs_2014_all, viirs_2014_dups, 
+   viirs_2014_rep, viirs_2014_unique)
+```
+
+##### rasterize 2014 
+```{r}
+### set base values (will not change with loop)
+### 1. file path for cbi raster
+cbi_rast_path <- "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_mtbs_firedpy/"
+### 2. set EPSG
+target_epsg <- "+init=EPSG:6350"
+### 3. file path for output rasters
+output_rast_path <- "E:/usda_2023/usfs_fuel_treatments/western_us/viirs_rast_date/"
+
+### write loop
+for (i in 1:length(viirs_2014_split)) {
+# for (i in 22:length(viirs_2014_split)) {
+  
+  ### print step
+  print(paste0("STEP ", i))
+  
+  ### get the first one
+  test <- viirs_2014_split[[i]]
+  
+  if(nrow(test) > 2) {
+    
+    ### extract fire id
+    test_f_id <- unique(test$Fire_ID)
+    
+    ### get test fire perimeter
+    test_f_perim <- mt_fp %>%
+      filter(Fire_ID == test_f_id) %>%
+      distinct()
+    
+    ### open cbi raster for that fire
+    test_cbi <- raster(file.path(paste0(cbi_rast_path, test_f_id, ".tif")))
+    
+    ### project to correct epsg
+    test_cbi <- projectRaster(test_cbi,
+                              crs = target_epsg)
+    
+    ### columns for raster
+    test <- test %>%
+      dplyr::select(Fire_ID,
+                    ACQ_DATE,
+                    FRP, 
+                    Fire_Year)
+    
+    ### get date of fire
+    ig_date_fire <- test_f_perim$ig_date
+    
+    ### get acquisition date relative to ignition date 
+    ### acq_date_ig means that the image was captured on the first day of the fire, etc...
+    test <- test %>%
+      mutate(ig_date = ig_date_fire,
+             acq_date_ig = as.numeric(ACQ_DATE - ig_date_fire) + 1) %>%
+      
+      ### drop viirs detections from before the fire occurred
+      filter(acq_date_ig > 0)
+    
+    ### try with terra:rasterize
+    ### make cbi raster the right format
+    terra_rast <- rast(test_cbi)
+    
+    ### rasterize the viirs data
+    terra_raster <- terra::rasterize(x = test,
+                                     y = terra_rast,
+                                     "acq_date_ig",
+                                     fun = "min",
+                                     background = NA)
+    
+    # plot(terra_raster)
+    
+    ### try filling gaps - used window = 9, 15, 19, 29, 41, 51, 59
+    ### fill it with window = 89
+    fill_terra_raster <- terra::focal(x = terra_raster,
+                                      w = 89,
+                                      fun = mean,
+                                      na.policy = "only", 
+                                      na.rm = TRUE)
+    # plot(fill_terra_raster)
+    
+    ### only want round numbers
+    fill_terra_raster <- round(fill_terra_raster)
+    
+    ### write out
+    terra::writeRaster(fill_terra_raster,
+                       filename = file.path(paste0(output_rast_path,
+                                                   test_f_id,
+                                                   ".tif")),
+                       overwrite = TRUE)
+    
+  }}
+```
+
+#### viirs 2015
+```{r}
+### open viirs for 1 year
+viirs_2015 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_allfires_2015.shp") %>%
+  st_transform(., 6350)
+
+### make column for join lat/lon
+viirs_2015 <- viirs_2015 %>%
+  mutate(lat_lon = paste0(LATITUDE, "_",
+                          LONGITUDE))
+
+### are any of these points repeated? (= multiple viirs detections for a single point)
+viirs_2015_unique <- viirs_2015 
+st_geometry(viirs_2015_unique) <- NULL
+viirs_2015_rep <- viirs_2015_unique %>%
+  group_by(lat_lon) %>%
+  summarise(n_occur = n()) %>%
+  filter(n_occur > 1)
+
+### subset to these points
+viirs_2015_dups <- viirs_2015 %>%
+  filter(lat_lon %in% viirs_2015_rep$lat_lon)
+unique(viirs_2015_dups$Fire_ID)
+
+### are these the same acquisition date and overlapping MTBS and firedpy?
+st_geometry(viirs_2015_dups) <- NULL
+dups_acq <- viirs_2015_dups %>%
+  group_by(lat_lon, ACQ_DATE, ACQ_TIME) %>%
+  summarise(n_occur = n())
+
+### which fires are included here?
+viirs_dup_fires <- viirs_2015 %>%
+  filter(lat_lon %in% dups_acq$lat_lon) %>%
+  dplyr::select(Fire_ID)
+st_geometry(viirs_dup_fires) <- NULL
+viirs_dup_fires <- distinct(viirs_dup_fires)
+
+### CA4091312343720150731 overlaps with 326887, 327721
+### WA4833811900220150813 overlaps with 327797
+### OR4500511742020150811 overlaps with 329010
+### ID4773311613120150812 overlaps with 331081
+### CA3687411890520150801 overlaps with 328264
+
+### all the repeats are the same VIIRS records for overlapping fires
+
+### rows to drop
+viirs_2015_dups <- viirs_2015_dups %>%
+  mutate(fire_source = nchar(Fire_ID)) %>%
+  filter(fire_source < 20)
+
+### make fire id latlon col
+viirs_2015_dups <- viirs_2015_dups %>%
+  mutate(drop_col = paste0(Fire_ID, "_", lat_lon))
+viirs_2015 <- viirs_2015 %>%
+  mutate(drop_col = paste0(Fire_ID, "_", lat_lon))
+
+### remove these dups from viirs_2015
+viirs_2015 <- viirs_2015 %>%
+  filter(!drop_col %in% viirs_2015_dups$drop_col)
+rm(viirs_2015_dups, viirs_2015_rep, viirs_2015_unique)
+
+## now all rows are unique
+
+### drop cols that aren't in gee df
+viirs_2015 <- viirs_2015 %>%
+  dplyr::select(-LATITUDE, -LONGITUDE, 
+                -lat_lon, -drop_col)
+
+### subset viirs_gee
+viirs_gee_2015 <- viirs_gee %>%
+  filter(Fire_Year == 2015)
+
+### combine
+viirs_2015_all <- rbind(viirs_2015, 
+                        viirs_gee_2015)
+
+# ### make function for square buffers
+# sq_buff <- function(x, a) {
+#   a <- sqrt(a)/2
+#   return(sf::st_buffer(x, 
+#                        dist = a, 
+#                        nQuadSegs = 1,
+#                        endCapStyle = "SQUARE"))
+# }
+
+### distance for buff
+buff_dist <- 375/2
+
+### add square buffer around all points
+viirs_2015_all <- viirs_2015_all %>%
+  sf::st_buffer(dist = buff_dist,
+                endCapStyle = "SQUARE")
+
+# ### add square buffer around all points
+# viirs_2015_all <- st_buffer(viirs_2015_all,
+#                             187.5)
+
+### split by wildfire ID
+viirs_2015_split <- split(viirs_2015_all, viirs_2015_all$Fire_ID)
+```
+
+##### rasterize 2015 
+```{r}
+### set base values (will not change with loop)
+### 1. file path for cbi raster
+cbi_rast_path <- "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_mtbs_firedpy/"
+### 2. set EPSG
+target_epsg <- "+init=EPSG:6350"
+### 3. file path for output rasters
+output_rast_path <- "E:/usda_2023/usfs_fuel_treatments/western_us/viirs_rast_date/"
+
+### write loop
+for (i in 1:length(viirs_2015_split)) {
+# for (i in 22:length(viirs_2015_split)) {
+  
+  ### print step
+  print(paste0("STEP ", i))
+  
+  ### get the first one
+  test <- viirs_2015_split[[i]]
+  
+  if(nrow(test) > 2) {
+    
+    ### extract fire id
+    test_f_id <- unique(test$Fire_ID)
+    
+    ### get test fire perimeter
+    test_f_perim <- mt_fp %>%
+      filter(Fire_ID == test_f_id) %>%
+      distinct()
+    
+    ### open cbi raster for that fire
+    test_cbi <- raster(file.path(paste0(cbi_rast_path, test_f_id, ".tif")))
+    
+    ### project to correct epsg
+    test_cbi <- projectRaster(test_cbi,
+                              crs = target_epsg)
+    
+    ### columns for raster
+    test <- test %>%
+      dplyr::select(Fire_ID,
+                    ACQ_DATE,
+                    FRP, 
+                    Fire_Year)
+    
+    ### get date of fire
+    ig_date_fire <- test_f_perim$ig_date
+    
+    ### get acquisition date relative to ignition date 
+    ### acq_date_ig means that the image was captured on the first day of the fire, etc...
+    test <- test %>%
+      mutate(ig_date = ig_date_fire,
+             acq_date_ig = as.numeric(ACQ_DATE - ig_date_fire) + 1) %>%
+      
+      ### drop viirs detections from before the fire occurred
+      filter(acq_date_ig > 0)
+    
+    ### try with terra:rasterize
+    ### make cbi raster the right format
+    terra_rast <- rast(test_cbi)
+    
+    ### rasterize the viirs data
+    terra_raster <- terra::rasterize(x = test,
+                                     y = terra_rast,
+                                     "acq_date_ig",
+                                     fun = "min",
+                                     background = NA)
+    
+    # plot(terra_raster)
+    
+    ### try filling gaps - used window = 9, 15, 19, 29, 41, 51, 59
+    ### fill it with window = 89
+    fill_terra_raster <- terra::focal(x = terra_raster,
+                                      w = 89,
+                                      fun = mean,
+                                      na.policy = "only", 
+                                      na.rm = TRUE)
+    # plot(fill_terra_raster)
+    
+    ### only want round numbers
+    fill_terra_raster <- round(fill_terra_raster)
+    
+    ### write out
+    terra::writeRaster(fill_terra_raster,
+                       filename = file.path(paste0(output_rast_path,
+                                                   test_f_id,
+                                                   ".tif")),
+                       overwrite = TRUE)
+    
+  }}
+```
+
+#### viirs 2016
+```{r}
+### open viirs for 1 year
+viirs_2016 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_allfires_2016.shp") %>%
+  st_transform(., 6350)
+
+### make column for join lat/lon
+viirs_2016 <- viirs_2016 %>%
+  mutate(lat_lon = paste0(LATITUDE, "_",
+                          LONGITUDE))
+
+### are any of these points repeated? (= multiple viirs detections for a single point)
+viirs_2016_unique <- viirs_2016 
+st_geometry(viirs_2016_unique) <- NULL
+viirs_2016_rep <- viirs_2016_unique %>%
+  group_by(lat_lon) %>%
+  summarise(n_occur = n()) %>%
+  filter(n_occur > 1)
+
+### subset to these points
+viirs_2016_dups <- viirs_2016 %>%
+  filter(lat_lon %in% viirs_2016_rep$lat_lon)
+unique(viirs_2016_dups$Fire_ID)
+
+### are these the same acquisition date and overlapping MTBS and firedpy?
+st_geometry(viirs_2016_dups) <- NULL
+dups_acq <- viirs_2016_dups %>%
+  group_by(lat_lon, ACQ_DATE, ACQ_TIME) %>%
+  summarise(n_occur = n())
+
+### which fires are included here?
+viirs_dup_fires <- viirs_2016 %>%
+  filter(lat_lon %in% dups_acq$lat_lon) %>%
+  dplyr::select(Fire_ID)
+st_geometry(viirs_dup_fires) <- NULL
+viirs_dup_fires <- distinct(viirs_dup_fires)
+
+### ID4395011576220160718 and ID4426111543220160807 have the slightest of overlaps, just due to pixels at the boundaries
+### CO4095810663420160619 overlaps with 345939
+### CA3778011892120160917 and CA3779911892220160804 have the slightest of overlaps, just due to pixels at the boundaries
+
+### all the repeats are the same VIIRS records for overlapping fires - drop the firedpy one but keep all others
+
+### rows to drop
+viirs_2016_dups <- viirs_2016_dups %>%
+  mutate(fire_source = nchar(Fire_ID)) %>%
+  filter(fire_source < 20)
+
+### make fire id latlon col
+viirs_2016_dups <- viirs_2016_dups %>%
+  mutate(drop_col = paste0(Fire_ID, "_", lat_lon))
+viirs_2016 <- viirs_2016 %>%
+  mutate(drop_col = paste0(Fire_ID, "_", lat_lon))
+
+### remove these dups from viirs_2016
+viirs_2016 <- viirs_2016 %>%
+  filter(!drop_col %in% viirs_2016_dups$drop_col)
+rm(viirs_2016_dups, viirs_2016_rep, viirs_2016_unique)
+
+## now all rows are unique
+
+### drop cols that aren't in gee df
+viirs_2016 <- viirs_2016 %>%
+  dplyr::select(-LATITUDE, -LONGITUDE, 
+                -lat_lon, -drop_col)
+
+### subset viirs_gee
+viirs_gee_2016 <- viirs_gee %>%
+  filter(Fire_Year == 2016)
+
+### combine
+viirs_2016_all <- rbind(viirs_2016, 
+                        viirs_gee_2016)
+
+# ### make function for square buffers
+# sq_buff <- function(x, a) {
+#   a <- sqrt(a)/2
+#   return(sf::st_buffer(x, 
+#                        dist = a, 
+#                        nQuadSegs = 1,
+#                        endCapStyle = "SQUARE"))
+# }
+
+### distance for buff
+buff_dist <- 375/2
+
+### add square buffer around all points
+viirs_2016_all <- viirs_2016_all %>%
+  sf::st_buffer(dist = buff_dist,
+                endCapStyle = "SQUARE")
+
+# ### add square buffer around all points
+# viirs_2016_all <- st_buffer(viirs_2016_all,
+#                             187.5)
+
+### split by wildfire ID
+viirs_2016_split <- split(viirs_2016_all, viirs_2016_all$Fire_ID)
+```
+
+##### rasterize 2016 
+```{r}
+### set base values (will not change with loop)
+### 1. file path for cbi raster
+cbi_rast_path <- "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_mtbs_firedpy/"
+### 2. set EPSG
+target_epsg <- "+init=EPSG:6350"
+### 3. file path for output rasters
+output_rast_path <- "E:/usda_2023/usfs_fuel_treatments/western_us/viirs_rast_date/"
+
+### write loop
+for (i in 1:length(viirs_2016_split)) {
+# for (i in 22:length(viirs_2016_split)) {
+  
+  ### print step
+  print(paste0("STEP ", i))
+  
+  ### get the first one
+  test <- viirs_2016_split[[i]]
+  
+  if(nrow(test) > 2) {
+    
+    ### extract fire id
+    test_f_id <- unique(test$Fire_ID)
+    
+    ### get test fire perimeter
+    test_f_perim <- mt_fp %>%
+      filter(Fire_ID == test_f_id) %>%
+      distinct()
+    
+    ### open cbi raster for that fire
+    test_cbi <- raster(file.path(paste0(cbi_rast_path, test_f_id, ".tif")))
+    
+    ### project to correct epsg
+    test_cbi <- projectRaster(test_cbi,
+                              crs = target_epsg)
+    
+    ### columns for raster
+    test <- test %>%
+      dplyr::select(Fire_ID,
+                    ACQ_DATE,
+                    FRP, 
+                    Fire_Year)
+    
+    ### get date of fire
+    ig_date_fire <- test_f_perim$ig_date
+    
+    ### get acquisition date relative to ignition date 
+    ### acq_date_ig means that the image was captured on the first day of the fire, etc...
+    test <- test %>%
+      mutate(ig_date = ig_date_fire,
+             acq_date_ig = as.numeric(ACQ_DATE - ig_date_fire) + 1) %>%
+      
+      ### drop viirs detections from before the fire occurred
+      filter(acq_date_ig > 0)
+    
+    ### try with terra:rasterize
+    ### make cbi raster the right format
+    terra_rast <- rast(test_cbi)
+    
+    ### rasterize the viirs data
+    terra_raster <- terra::rasterize(x = test,
+                                     y = terra_rast,
+                                     "acq_date_ig",
+                                     fun = "min",
+                                     background = NA)
+    
+    # plot(terra_raster)
+    
+    ### try filling gaps - used window = 9, 15, 19, 29, 41, 51, 59
+    ### fill it with window = 89
+    fill_terra_raster <- terra::focal(x = terra_raster,
+                                      w = 89,
+                                      fun = mean,
+                                      na.policy = "only", 
+                                      na.rm = TRUE)
+    # plot(fill_terra_raster)
+    
+    ### only want round numbers
+    fill_terra_raster <- round(fill_terra_raster)
+    
+    ### write out
+    terra::writeRaster(fill_terra_raster,
+                       filename = file.path(paste0(output_rast_path,
+                                                   test_f_id,
+                                                   ".tif")),
+                       overwrite = TRUE)
+    
+  }}
+```
+
+#### viirs 2017
+```{r}
+### open viirs for 1 year
+viirs_2017 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_allfires_2017.shp") %>%
+  st_transform(., 6350)
+
+### make column for join lat/lon
+viirs_2017 <- viirs_2017 %>%
+  mutate(lat_lon = paste0(LATITUDE, "_",
+                          LONGITUDE))
+
+### are any of these points repeated? (= multiple viirs detections for a single point)
+viirs_2017_unique <- viirs_2017 
+st_geometry(viirs_2017_unique) <- NULL
+viirs_2017_rep <- viirs_2017_unique %>%
+  group_by(lat_lon) %>%
+  summarise(n_occur = n()) %>%
+  filter(n_occur > 1)
+
+### subset to these points
+viirs_2017_dups <- viirs_2017 %>%
+  filter(lat_lon %in% viirs_2017_rep$lat_lon)
+unique(viirs_2017_dups$Fire_ID)
+
+### are these the same acquisition date and overlapping MTBS and firedpy?
+st_geometry(viirs_2017_dups) <- NULL
+dups_acq <- viirs_2017_dups %>%
+  group_by(lat_lon, ACQ_DATE, ACQ_TIME) %>%
+  summarise(n_occur = n())
+
+### which fires are included here?
+viirs_dup_fires <- viirs_2017 %>%
+  filter(lat_lon %in% dups_acq$lat_lon) %>%
+  dplyr::select(Fire_ID)
+st_geometry(viirs_dup_fires) <- NULL
+viirs_dup_fires <- distinct(viirs_dup_fires)
+
+### OR4330612262220170812 overlaps with 371379
+### OR4470812185620170724 overlaps with 369512
+### MT4667411426820170715 overlaps with 371653
+### MT4644711368920170713 overlaps with 368171
+### CA3837311989620170819 overlaps with 371578
+### CA4143512316220170626 overlaps with 371189
+### CA4145212338020170811 overlaps with 371109
+
+### all the repeats are the same VIIRS records for overlapping fires - drop the firedpy one but keep all others
+
+### rows to drop
+viirs_2017_dups <- viirs_2017_dups %>%
+  mutate(fire_source = nchar(Fire_ID)) %>%
+  filter(fire_source < 20)
+
+### make fire id latlon col
+viirs_2017_dups <- viirs_2017_dups %>%
+  mutate(drop_col = paste0(Fire_ID, "_", lat_lon))
+viirs_2017 <- viirs_2017 %>%
+  mutate(drop_col = paste0(Fire_ID, "_", lat_lon))
+
+### remove these dups from viirs_2017
+viirs_2017 <- viirs_2017 %>%
+  filter(!drop_col %in% viirs_2017_dups$drop_col)
+rm(viirs_2017_dups, viirs_2017_rep, viirs_2017_unique)
+
+## now all rows are unique
+
+### drop cols that aren't in gee df
+viirs_2017 <- viirs_2017 %>%
+  dplyr::select(-LATITUDE, -LONGITUDE, 
+                -lat_lon, -drop_col)
+
+### subset viirs_gee
+viirs_gee_2017 <- viirs_gee %>%
+  filter(Fire_Year == 2017)
+
+### combine
+viirs_2017_all <- rbind(viirs_2017, 
+                        viirs_gee_2017)
+
+# ### make function for square buffers
+# sq_buff <- function(x, a) {
+#   a <- sqrt(a)/2
+#   return(sf::st_buffer(x, 
+#                        dist = a, 
+#                        nQuadSegs = 1,
+#                        endCapStyle = "SQUARE"))
+# }
+
+### distance for buff
+buff_dist <- 375/2
+
+### add square buffer around all points
+viirs_2017_all <- viirs_2017_all %>%
+  sf::st_buffer(dist = buff_dist,
+                endCapStyle = "SQUARE")
+
+# ### add square buffer around all points
+# viirs_2017_all <- st_buffer(viirs_2017_all,
+#                             187.5)
+
+### split by wildfire ID
+viirs_2017_split <- split(viirs_2017_all, viirs_2017_all$Fire_ID)
+```
+
+##### rasterize 2017 
+```{r}
+### set base values (will not change with loop)
+### 1. file path for cbi raster
+cbi_rast_path <- "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_mtbs_firedpy/"
+### 2. set EPSG
+target_epsg <- "+init=EPSG:6350"
+### 3. file path for output rasters
+output_rast_path <- "E:/usda_2023/usfs_fuel_treatments/western_us/viirs_rast_date/"
+
+### write loop
+for (i in 1:length(viirs_2017_split)) {
+  # for (i in 22:length(viirs_2017_split)) {
+  
+  ### print step
+  print(paste0("STEP ", i))
+  
+  ### get the first one
+  test <- viirs_2017_split[[i]]
+  
+  if(nrow(test) > 2) {
+    
+    ### extract fire id
+    test_f_id <- unique(test$Fire_ID)
+    
+    ### get test fire perimeter
+    test_f_perim <- mt_fp %>%
+      filter(Fire_ID == test_f_id) %>%
+      distinct()
+    
+    ### open cbi raster for that fire
+    test_cbi <- raster(file.path(paste0(cbi_rast_path, test_f_id, ".tif")))
+    
+    ### project to correct epsg
+    test_cbi <- projectRaster(test_cbi,
+                              crs = target_epsg)
+    
+    ### columns for raster
+    test <- test %>%
+      dplyr::select(Fire_ID,
+                    ACQ_DATE,
+                    FRP, 
+                    Fire_Year)
+    
+    ### get date of fire
+    ig_date_fire <- test_f_perim$ig_date
+    
+    ### get acquisition date relative to ignition date 
+    ### acq_date_ig means that the image was captured on the first day of the fire, etc...
+    test <- test %>%
+      mutate(ig_date = ig_date_fire,
+             acq_date_ig = as.numeric(ACQ_DATE - ig_date_fire) + 1) %>%
+      
+      ### drop viirs detections from before the fire occurred
+      filter(acq_date_ig > 0)
+    
+    if(nrow(test) > 2) {
+      
+      ### try with terra:rasterize
+      ### make cbi raster the right format
+      terra_rast <- rast(test_cbi)
+      
+      ### rasterize the viirs data
+      terra_raster <- terra::rasterize(x = test,
+                                       y = terra_rast,
+                                       "acq_date_ig",
+                                       fun = "min",
+                                       background = NA)
+      
+      # plot(terra_raster)
+      
+      ### try filling gaps - used window = 9, 15, 19, 29, 41, 51, 59
+      ### fill it with window = 89
+      fill_terra_raster <- terra::focal(x = terra_raster,
+                                        w = 89,
+                                        fun = mean,
+                                        na.policy = "only", 
+                                        na.rm = TRUE)
+      # plot(fill_terra_raster)
+      
+      ### only want round numbers
+      fill_terra_raster <- round(fill_terra_raster)
+      
+      ### write out
+      terra::writeRaster(fill_terra_raster,
+                         filename = file.path(paste0(output_rast_path,
+                                                     test_f_id,
+                                                     ".tif")),
+                         overwrite = TRUE)
+      
+    }
+  }
+}
+
+## clean up
+rm(viirs_2017, viirs_2017_all, viirs_2017_split, viirs_gee_2017)
+```
+
+#### viirs 2018
+```{r}
+### open viirs for 1 year
+viirs_2018 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_allfires_2018.shp") %>%
+  st_transform(., 6350)
+
+### make column for join lat/lon
+viirs_2018 <- viirs_2018 %>%
+  mutate(lat_lon = paste0(LATITUDE, "_",
+                          LONGITUDE))
+
+### are any of these points repeated? (= multiple viirs detections for a single point)
+viirs_2018_unique <- viirs_2018 
+st_geometry(viirs_2018_unique) <- NULL
+viirs_2018_rep <- viirs_2018_unique %>%
+  group_by(lat_lon) %>%
+  summarise(n_occur = n()) %>%
+  filter(n_occur > 1)
+
+### subset to these points
+viirs_2018_dups <- viirs_2018 %>%
+  filter(lat_lon %in% viirs_2018_rep$lat_lon)
+unique(viirs_2018_dups$Fire_ID)
+
+# ### are these the same acquisition date and overlapping MTBS and firedpy?
+# st_geometry(viirs_2018_dups) <- NULL
+# dups_acq <- viirs_2018_dups %>%
+#   group_by(lat_lon, ACQ_DATE, ACQ_TIME) %>%
+#   summarise(n_occur = n())
+# 
+# ### which fires are included here?
+# viirs_dup_fires <- viirs_2018 %>%
+#   filter(lat_lon %in% dups_acq$lat_lon) %>%
+#   dplyr::select(Fire_ID)
+# st_geometry(viirs_dup_fires) <- NULL
+# viirs_dup_fires <- distinct(viirs_dup_fires)
+
+### OR4237012386020180716 and OR4252812357120180715 slightly overlap at boundary
+### OR4237012386020180716 overlaps with 389742
+### WY4102310619920180610 overlaps with 384383 and 387685
+### OR4265012082720180815 overlaps with 390214
+
+### all the repeats are the same VIIRS records for overlapping fires - drop the firedpy one but keep all others
+
+### rows to drop
+viirs_2018_dups <- viirs_2018_dups %>%
+  mutate(fire_source = nchar(Fire_ID)) %>%
+  filter(fire_source < 20)
+
+### make fire id latlon col
+viirs_2018_dups <- viirs_2018_dups %>%
+  mutate(drop_col = paste0(Fire_ID, "_", lat_lon))
+viirs_2018 <- viirs_2018 %>%
+  mutate(drop_col = paste0(Fire_ID, "_", lat_lon))
+
+### remove these dups from viirs_2018
+viirs_2018 <- viirs_2018 %>%
+  filter(!drop_col %in% viirs_2018_dups$drop_col)
+rm(viirs_2018_dups, viirs_2018_rep, viirs_2018_unique)
+
+## now all rows are unique
+
+### drop cols that aren't in gee df
+viirs_2018 <- viirs_2018 %>%
+  dplyr::select(-LATITUDE, -LONGITUDE, 
+                -lat_lon, -drop_col)
+
+### subset viirs_gee
+viirs_gee_2018 <- viirs_gee %>%
+  filter(Fire_Year == 2018)
+
+### combine
+viirs_2018_all <- rbind(viirs_2018, 
+                        viirs_gee_2018)
+
+# ### make function for square buffers
+# sq_buff <- function(x, a) {
+#   a <- sqrt(a)/2
+#   return(sf::st_buffer(x, 
+#                        dist = a, 
+#                        nQuadSegs = 1,
+#                        endCapStyle = "SQUARE"))
+# }
+
+### distance for buff
+buff_dist <- 375/2
+
+### add square buffer around all points
+viirs_2018_all <- viirs_2018_all %>%
+  sf::st_buffer(dist = buff_dist,
+                endCapStyle = "SQUARE")
+
+# ### add square buffer around all points
+# viirs_2018_all <- st_buffer(viirs_2018_all,
+#                             187.5)
+
+### split by wildfire ID
+viirs_2018_split <- split(viirs_2018_all, viirs_2018_all$Fire_ID)
+```
+
+##### rasterize 2018 
+```{r}
+### set base values (will not change with loop)
+### 1. file path for cbi raster
+cbi_rast_path <- "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_mtbs_firedpy/"
+### 2. set EPSG
+target_epsg <- "+init=EPSG:6350"
+### 3. file path for output rasters
+output_rast_path <- "E:/usda_2023/usfs_fuel_treatments/western_us/viirs_rast_date/"
+
+### write loop
+for (i in 1:length(viirs_2018_split)) {
+  # for (i in 22:length(viirs_2018_split)) {
+  
+  ### print step
+  print(paste0("STEP ", i))
+  
+  ### get the first one
+  test <- viirs_2018_split[[i]]
+  
+  if(nrow(test) > 2) {
+    
+    ### extract fire id
+    test_f_id <- unique(test$Fire_ID)
+    
+    ### get test fire perimeter
+    test_f_perim <- mt_fp %>%
+      filter(Fire_ID == test_f_id) %>%
+      distinct()
+    
+    ### open cbi raster for that fire
+    test_cbi <- raster(file.path(paste0(cbi_rast_path, test_f_id, ".tif")))
+    
+    ### project to correct epsg
+    test_cbi <- projectRaster(test_cbi,
+                              crs = target_epsg)
+    
+    ### columns for raster
+    test <- test %>%
+      dplyr::select(Fire_ID,
+                    ACQ_DATE,
+                    FRP, 
+                    Fire_Year)
+    
+    ### get date of fire
+    ig_date_fire <- test_f_perim$ig_date
+    
+    ### get acquisition date relative to ignition date 
+    ### acq_date_ig means that the image was captured on the first day of the fire, etc...
+    test <- test %>%
+      mutate(ig_date = ig_date_fire,
+             acq_date_ig = as.numeric(ACQ_DATE - ig_date_fire) + 1) %>%
+      
+      ### drop viirs detections from before the fire occurred
+      filter(acq_date_ig > 0)
+    
+    if(nrow(test) > 2) {
+      
+      ### try with terra:rasterize
+      ### make cbi raster the right format
+      terra_rast <- rast(test_cbi)
+      
+      ### rasterize the viirs data
+      terra_raster <- terra::rasterize(x = test,
+                                       y = terra_rast,
+                                       "acq_date_ig",
+                                       fun = "min",
+                                       background = NA)
+      
+      # plot(terra_raster)
+      
+      ### try filling gaps - used window = 9, 15, 19, 29, 41, 51, 59
+      ### fill it with window = 89
+      fill_terra_raster <- terra::focal(x = terra_raster,
+                                        w = 89,
+                                        fun = mean,
+                                        na.policy = "only", 
+                                        na.rm = TRUE)
+      # plot(fill_terra_raster)
+      
+      ### only want round numbers
+      fill_terra_raster <- round(fill_terra_raster)
+      
+      ### write out
+      terra::writeRaster(fill_terra_raster,
+                         filename = file.path(paste0(output_rast_path,
+                                                     test_f_id,
+                                                     ".tif")),
+                         overwrite = TRUE)
+      
+    }
+  }
+}
+
+## clean up
+rm(viirs_2018, viirs_2018_all, viirs_2018_split, viirs_gee_2018)
+```
+
+#### viirs 2019
+```{r}
+### open viirs for 1 year
+viirs_2019 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_allfires_2019.shp") %>%
+  st_transform(., 6350)
+
+### make column for join lat/lon
+viirs_2019 <- viirs_2019 %>%
+  mutate(lat_lon = paste0(LATITUDE, "_",
+                          LONGITUDE))
+
+### are any of these points repeated? (= multiple viirs detections for a single point)
+viirs_2019_unique <- viirs_2019 
+st_geometry(viirs_2019_unique) <- NULL
+viirs_2019_rep <- viirs_2019_unique %>%
+  group_by(lat_lon) %>%
+  summarise(n_occur = n()) %>%
+  filter(n_occur > 1)
+
+### subset to these points
+viirs_2019_dups <- viirs_2019 %>%
+  filter(lat_lon %in% viirs_2019_rep$lat_lon)
+unique(viirs_2019_dups$Fire_ID)
+
+# ### are these the same acquisition date and overlapping MTBS and firedpy?
+# st_geometry(viirs_2019_dups) <- NULL
+# dups_acq <- viirs_2019_dups %>%
+#   group_by(lat_lon, ACQ_DATE, ACQ_TIME) %>%
+#   summarise(n_occur = n())
+# 
+# ### which fires are included here?
+# viirs_dup_fires <- viirs_2019 %>%
+#   filter(lat_lon %in% dups_acq$lat_lon) %>%
+#   dplyr::select(Fire_ID)
+# st_geometry(viirs_dup_fires) <- NULL
+# viirs_dup_fires <- distinct(viirs_dup_fires)
+
+### UT3828311251320190618 and UT3829911250120191002 slightly overlap at boundary
+### AZ3501011190120190802 and AZ3504411184020190902 slightly overlap at boundary
+### CA3782611887220190726 overlaps with 412352 and 412365
+
+### all the repeats are the same VIIRS records for overlapping fires - drop the firedpy one but keep all others
+
+### rows to drop
+viirs_2019_dups <- viirs_2019_dups %>%
+  mutate(fire_source = nchar(Fire_ID)) %>%
+  filter(fire_source < 20)
+
+### make fire id latlon col
+viirs_2019_dups <- viirs_2019_dups %>%
+  mutate(drop_col = paste0(Fire_ID, "_", lat_lon))
+viirs_2019 <- viirs_2019 %>%
+  mutate(drop_col = paste0(Fire_ID, "_", lat_lon))
+
+### remove these dups from viirs_2019
+viirs_2019 <- viirs_2019 %>%
+  filter(!drop_col %in% viirs_2019_dups$drop_col)
+rm(viirs_2019_dups, viirs_2019_rep, viirs_2019_unique)
+
+## now all rows are unique
+
+### drop cols that aren't in gee df
+viirs_2019 <- viirs_2019 %>%
+  dplyr::select(-LATITUDE, -LONGITUDE, 
+                -lat_lon, -drop_col)
+
+### subset viirs_gee
+viirs_gee_2019 <- viirs_gee %>%
+  filter(Fire_Year == 2019)
+
+### combine
+viirs_2019_all <- rbind(viirs_2019, 
+                        viirs_gee_2019)
+
+# ### make function for square buffers
+# sq_buff <- function(x, a) {
+#   a <- sqrt(a)/2
+#   return(sf::st_buffer(x, 
+#                        dist = a, 
+#                        nQuadSegs = 1,
+#                        endCapStyle = "SQUARE"))
+# }
+
+### distance for buff
+buff_dist <- 375/2
+
+### add square buffer around all points
+viirs_2019_all <- viirs_2019_all %>%
+  sf::st_buffer(dist = buff_dist,
+                endCapStyle = "SQUARE")
+
+# ### add square buffer around all points
+# viirs_2019_all <- st_buffer(viirs_2019_all,
+#                             187.5)
+
+### split by wildfire ID
+viirs_2019_split <- split(viirs_2019_all, viirs_2019_all$Fire_ID)
+```
+
+##### rasterize 2019 
+```{r}
+### set base values (will not change with loop)
+### 1. file path for cbi raster
+cbi_rast_path <- "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_mtbs_firedpy/"
+### 2. set EPSG
+target_epsg <- "+init=EPSG:6350"
+### 3. file path for output rasters
+output_rast_path <- "E:/usda_2023/usfs_fuel_treatments/western_us/viirs_rast_date/"
+
+### write loop
+for (i in 1:length(viirs_2019_split)) {
+  # for (i in 22:length(viirs_2019_split)) {
+  
+  ### print step
+  print(paste0("STEP ", i))
+  
+  ### get the first one
+  test <- viirs_2019_split[[i]]
+  
+  if(nrow(test) > 2) {
+    
+    ### extract fire id
+    test_f_id <- unique(test$Fire_ID)
+    
+    ### get test fire perimeter
+    test_f_perim <- mt_fp %>%
+      filter(Fire_ID == test_f_id) %>%
+      distinct()
+    
+    ### open cbi raster for that fire
+    test_cbi <- raster(file.path(paste0(cbi_rast_path, test_f_id, ".tif")))
+    
+    ### project to correct epsg
+    test_cbi <- projectRaster(test_cbi,
+                              crs = target_epsg)
+    
+    ### columns for raster
+    test <- test %>%
+      dplyr::select(Fire_ID,
+                    ACQ_DATE,
+                    FRP, 
+                    Fire_Year)
+    
+    ### get date of fire
+    ig_date_fire <- test_f_perim$ig_date
+    
+    ### get acquisition date relative to ignition date 
+    ### acq_date_ig means that the image was captured on the first day of the fire, etc...
+    test <- test %>%
+      mutate(ig_date = ig_date_fire,
+             acq_date_ig = as.numeric(ACQ_DATE - ig_date_fire) + 1) %>%
+      
+      ### drop viirs detections from before the fire occurred
+      filter(acq_date_ig > 0)
+    
+    if(nrow(test) > 2) {
+      
+      ### try with terra:rasterize
+      ### make cbi raster the right format
+      terra_rast <- rast(test_cbi)
+      
+      ### rasterize the viirs data
+      terra_raster <- terra::rasterize(x = test,
+                                       y = terra_rast,
+                                       "acq_date_ig",
+                                       fun = "min",
+                                       background = NA)
+      
+      # plot(terra_raster)
+      
+      ### try filling gaps - used window = 9, 15, 19, 29, 41, 51, 59
+      ### fill it with window = 89
+      fill_terra_raster <- terra::focal(x = terra_raster,
+                                        w = 89,
+                                        fun = mean,
+                                        na.policy = "only", 
+                                        na.rm = TRUE)
+      # plot(fill_terra_raster)
+      
+      ### only want round numbers
+      fill_terra_raster <- round(fill_terra_raster)
+      
+      ### write out
+      terra::writeRaster(fill_terra_raster,
+                         filename = file.path(paste0(output_rast_path,
+                                                     test_f_id,
+                                                     ".tif")),
+                         overwrite = TRUE)
+      
+    }
+  }
+}
+
+## clean up
+rm(viirs_2019, viirs_2019_all, viirs_2019_split, viirs_gee_2019)
+```
+
+#### viirs 2020
+```{r}
+### open viirs for 1 year
+viirs_2020 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_allfires_2020.shp") %>%
+  st_transform(., 6350)
+
+### make column for join lat/lon
+viirs_2020 <- viirs_2020 %>%
+  mutate(lat_lon = paste0(LATITUDE, "_",
+                          LONGITUDE))
+
+### are any of these points repeated? (= multiple viirs detections for a single point)
+viirs_2020_unique <- viirs_2020 
+st_geometry(viirs_2020_unique) <- NULL
+viirs_2020_rep <- viirs_2020_unique %>%
+  group_by(lat_lon) %>%
+  summarise(n_occur = n()) %>%
+  filter(n_occur > 1)
+
+### subset to these points
+viirs_2020_dups <- viirs_2020 %>%
+  filter(lat_lon %in% viirs_2020_rep$lat_lon)
+unique(viirs_2020_dups$Fire_ID)
+
+# ### are these the same acquisition date and overlapping MTBS and firedpy?
+# st_geometry(viirs_2020_dups) <- NULL
+# dups_acq <- viirs_2020_dups %>%
+#   group_by(lat_lon, ACQ_DATE, ACQ_TIME) %>%
+#   summarise(n_occur = n())
+# 
+# ### which fires are included here?
+# viirs_dup_fires <- viirs_2020 %>%
+#   filter(lat_lon %in% dups_acq$lat_lon) %>%
+#   dplyr::select(Fire_ID)
+# st_geometry(viirs_dup_fires) <- NULL
+# viirs_dup_fires <- distinct(viirs_dup_fires)
+
+### OR4472312167920200817 and OR4482112218820200816 slightly overlap at boundary
+### CA4009112093120200817 and CA3985812091220200817 overlap completely
+### OR4482112218820200816 overlaps with 433057
+### OR4472312167920200817 overlaps with 432192
+### CO4060910587920200813 overlaps with 433985
+### CA3966012280920200817 overlaps with 434340, 434337, and 433165
+### CA4118512343320200728 overlaps with 433285
+### CA4185812335420200908 overlaps with 432138
+
+### all the repeats are the same VIIRS records for overlapping fires - drop the firedpy one but keep all others
+
+### rows to drop
+viirs_2020_dups <- viirs_2020_dups %>%
+  mutate(fire_source = nchar(Fire_ID)) %>%
+  filter(fire_source < 20)
+
+### make fire id latlon col
+viirs_2020_dups <- viirs_2020_dups %>%
+  mutate(drop_col = paste0(Fire_ID, "_", lat_lon))
+viirs_2020 <- viirs_2020 %>%
+  mutate(drop_col = paste0(Fire_ID, "_", lat_lon))
+
+### remove these dups from viirs_2020
+viirs_2020 <- viirs_2020 %>%
+  filter(!drop_col %in% viirs_2020_dups$drop_col)
+rm(viirs_2020_dups, viirs_2020_rep, viirs_2020_unique)
+
+## now all rows are unique
+
+### drop cols that aren't in gee df
+viirs_2020 <- viirs_2020 %>%
+  dplyr::select(-LATITUDE, -LONGITUDE, 
+                -lat_lon, -drop_col)
+
+### subset viirs_gee
+viirs_gee_2020 <- viirs_gee %>%
+  filter(Fire_Year == 2020)
+
+### combine
+viirs_2020_all <- rbind(viirs_2020, 
+                        viirs_gee_2020)
+
+# ### make function for square buffers
+# sq_buff <- function(x, a) {
+#   a <- sqrt(a)/2
+#   return(sf::st_buffer(x, 
+#                        dist = a, 
+#                        nQuadSegs = 1,
+#                        endCapStyle = "SQUARE"))
+# }
+
+### distance for buff
+buff_dist <- 375/2
+
+### add square buffer around all points
+viirs_2020_all <- viirs_2020_all %>%
+  sf::st_buffer(dist = buff_dist,
+                endCapStyle = "SQUARE")
+
+# ### add square buffer around all points
+# viirs_2020_all <- st_buffer(viirs_2020_all,
+#                             187.5)
+
+### split by wildfire ID
+viirs_2020_split <- split(viirs_2020_all, viirs_2020_all$Fire_ID)
+```
+
+##### rasterize 2020 
+```{r}
+### set base values (will not change with loop)
+### 1. file path for cbi raster
+cbi_rast_path <- "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_mtbs_firedpy/"
+### 2. set EPSG
+target_epsg <- "+init=EPSG:6350"
+### 3. file path for output rasters
+output_rast_path <- "E:/usda_2023/usfs_fuel_treatments/western_us/viirs_rast_date/"
+
+### write loop
+for (i in 1:length(viirs_2020_split)) {
+  # for (i in 22:length(viirs_2020_split)) {
+  
+  ### print step
+  print(paste0("STEP ", i))
+  
+  ### get the first one
+  test <- viirs_2020_split[[i]]
+  
+  if(nrow(test) > 2) {
+    
+    ### extract fire id
+    test_f_id <- unique(test$Fire_ID)
+    
+    ### get test fire perimeter
+    test_f_perim <- mt_fp %>%
+      filter(Fire_ID == test_f_id) %>%
+      distinct()
+    
+    ### open cbi raster for that fire
+    test_cbi <- raster(file.path(paste0(cbi_rast_path, test_f_id, ".tif")))
+    
+    ### project to correct epsg
+    test_cbi <- projectRaster(test_cbi,
+                              crs = target_epsg)
+    
+    ### columns for raster
+    test <- test %>%
+      dplyr::select(Fire_ID,
+                    ACQ_DATE,
+                    FRP, 
+                    Fire_Year)
+    
+    ### get date of fire
+    ig_date_fire <- test_f_perim$ig_date
+    
+    ### get acquisition date relative to ignition date 
+    ### acq_date_ig means that the image was captured on the first day of the fire, etc...
+    test <- test %>%
+      mutate(ig_date = ig_date_fire,
+             acq_date_ig = as.numeric(ACQ_DATE - ig_date_fire) + 1) %>%
+      
+      ### drop viirs detections from before the fire occurred
+      filter(acq_date_ig > 0)
+    
+    if(nrow(test) > 2) {
+      
+      ### try with terra:rasterize
+      ### make cbi raster the right format
+      terra_rast <- rast(test_cbi)
+      
+      ### rasterize the viirs data
+      terra_raster <- terra::rasterize(x = test,
+                                       y = terra_rast,
+                                       "acq_date_ig",
+                                       fun = "min",
+                                       background = NA)
+      
+      # plot(terra_raster)
+      
+      ### try filling gaps - used window = 9, 15, 19, 29, 41, 51, 59
+      ### fill it with window = 89
+      fill_terra_raster <- terra::focal(x = terra_raster,
+                                        w = 89,
+                                        fun = mean,
+                                        na.policy = "only", 
+                                        na.rm = TRUE)
+      # plot(fill_terra_raster)
+      
+      ### only want round numbers
+      fill_terra_raster <- round(fill_terra_raster)
+      
+      ### write out
+      terra::writeRaster(fill_terra_raster,
+                         filename = file.path(paste0(output_rast_path,
+                                                     test_f_id,
+                                                     ".tif")),
+                         overwrite = TRUE)
+      
+    }
+  }
+}
+
+## clean up
+rm(viirs_2020, viirs_2020_all, viirs_2020_split, viirs_gee_2020)
+```
+
+## Missing fires
+Which fires are missing VIIRS data?
+```{r}
+### file list
+viirs_rasts <- list.files(path = "E:/usda_2023/usfs_fuel_treatments/western_us/viirs_rast_date",
+                        pattern = "*.tif")
+
+### drop .tif
+viirs_fires <- gsub(".tif", "", viirs_rasts)
+
+### which fires from mt_fp are missing?
+no_raster <- mt_fp %>%
+  filter(!Fire_ID %in% viirs_fires) ## 283 fires
+
+### 53 of these just don't have any fire detections -- filter them out
+
+### open fires that didn't have any VIIRS detections
+still_no <- read.csv("E:/usda_2023/usfs_fuel_treatments/western_us/fires_wo_viirs_data.csv")
+
+### filter out still_no
+no_raster <- no_raster %>%
+  filter(!Fire_ID %in% still_no$Fire_ID) 
+
+### now have 230 fires without a viirs raster
+
+### how many of these are pre-2012
+pre_2012 <- no_raster %>%
+  filter(Fire_Year < 2012)
+### 192 fires are pre-2012
+
+### drop the pre-2012 fires
+no_raster <- no_raster %>%
+  filter(Fire_Year > 2011)
+
+### 38 fires that have VIIRS detections but didn't end up having a VIIRS raster
+
+### 3 are MTBS fires: (see later code -- turns out the NM and CA fires actually have fewer than 3 VIIRS detections, so that's why they couldn't get rasterized)
+#### NM3389010763620170706
+#### MT4862011510220180812
+#### CA3449011860020180922
+
+### the other 35 are firedpy fires
+
+### calculate fire area
+no_raster$fire_area <- st_area(no_raster)
+
+### size of viirs pixel: 375 x 375 = 140625 m2
+
+### viirs pixels per fire
+no_raster <- no_raster %>%
+  mutate(viirs_pix = as.numeric(fire_area/140625))
+
+### how many of these fires got dropped because they contained less than 3 VIIRS pixels (the cut off in the code i used for the rasters)?
+no_raster <- no_raster %>%
+  filter(viirs_pix > 2) ## 18 fires were too small 
+
+### now how many of them just didn't have enough viirs detections (despite being large enough)?
+
+### open viirs detections
+viirs_2012 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_allfires_2012.shp") 
+viirs_2013 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_allfires_2013.shp")
+viirs_2014 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_allfires_2014.shp")
+viirs_2015 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_allfires_2015.shp")
+viirs_2016 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_allfires_2016.shp")
+viirs_2017 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_allfires_2017.shp")
+viirs_2018 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_allfires_2018.shp")
+viirs_2019 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_allfires_2019.shp")
+viirs_2020 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_allfires_2020.shp")##
+
+### combine and transform
+viirs_years <- rbind(viirs_2012,
+                     viirs_2013,
+                     viirs_2014,
+                     viirs_2015,
+                     viirs_2016,
+                     viirs_2017,
+                     viirs_2018,
+                     viirs_2019,
+                     viirs_2020)
+
+### transform and drop cols that aren't in viirs_gee
+viirs_years <- viirs_years %>%
+  st_transform(6350) %>%
+  dplyr::select(-LATITUDE, -LONGITUDE)
+
+### open viirs gee leftovers
+viirs_gee <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_data/viirs_gee_all_years.shp") %>%
+  st_transform(., 6350) %>%
+  dplyr::select(.,
+                BRIGHTNESS = bright_ti5,
+                SCAN = scan,
+                TRACK = track,
+                ACQ_DATE = acq_date,
+                ACQ_TIME = acq_time,
+                SATELLITE = satellite,
+                INSTRUMENT = instrument, 
+                CONFIDENCE = confidence,
+                VERSION = version,
+                BRIGHT_T31 = bright_ti4,
+                FRP = frp,
+                DAYNIGHT = daynight,
+                TYPE = type,
+                Fire_ID, Fire_Year, 
+                Start_Day, End_Day,
+                geometry)
+
+### combine
+viirs_all_pts <- rbind(viirs_years,
+                       viirs_gee)
+
+### subset viirs_gee to fires in no_rast to see how many detections they have
+viirs_no_rast <- viirs_all_pts %>%
+  filter(Fire_ID %in% no_raster$Fire_ID)
+
+### drop geom
+st_geometry(viirs_no_rast) <- NULL
+
+### combine with sf
+no_raster <- merge(x = no_raster,
+                   y = viirs_no_rast,
+                   by = c("Fire_ID", "Fire_Year", 
+                          "Start_Day", "End_Day"),
+                   all = TRUE)
+
+### version without geom
+no_raster_simp <- no_raster
+st_geometry(no_raster_simp) <- NULL
+
+### detections per fire
+viirs_per_fire <- no_raster_simp %>%
+  group_by(Fire_ID, Fire_Year, ig_date, fire_area, viirs_pix) %>%
+  summarise(n_viirs_detect = n())
+
+### fires with < 3 vIIRS detections: 301175, 301238, CA3449011860020180922, NM3389010763620170706
+
+### how many of these points burned before the ignition date
+no_raster_wrong_date <- no_raster_simp %>%
+  filter(ACQ_DATE < ig_date)
+### 376 out of 447 detections occurred BEFORE the fire actually started
+table(no_raster_wrong_date$Fire_ID)
+
+### points that burned after the ignition
+no_raster_post_ig <- no_raster_simp %>%
+  filter(ig_date <= ACQ_DATE)
+table(no_raster_post_ig$Fire_ID)
+
+### drop fires with < 3 VIIRS detections
+no_raster <- no_raster %>% 
+  filter(!Fire_ID %in% c("301175", "301238", 
+                         "CA3449011860020180922", 
+                         "NM3389010763620170706"))
+
+### drop viirs detections that occurred before the fire ignition date
+no_raster <- no_raster %>%
+  filter(ig_date <= ACQ_DATE)
+
+### and now drop fires that are left with fewer than 3 viirs detections
+table(no_raster$Fire_ID)
+no_raster <- no_raster %>%
+  filter(! Fire_ID %in% c("327797", "390214"))
+
+### how many fires does this leave us with?
+length(unique(no_raster$Fire_ID))
+
+### 7 fires. how many VIIRS detections per fire?
+table(no_raster$Fire_ID)
+
+### want to see these particular viirs detections more closely
+
+### get points for these fires
+viirs_check <- viirs_all_pts %>%
+  filter(Fire_ID %in% c("259058", "259502", 
+                        "368171", "369512", 
+                        "371379", "384383", "434337"))
+
+### these were fires that were dropped because of overlaps with MTBS fires
+```
+
+## Summary of fires without VIIRS (n = 283)
+- 192 fires were before 2012, so no VIIRS 
+- 53 2012-and-onward fires had no VIIRS detections (used GEE and direct data download to try to get them)
+- this means there were 38 fires that had VIIRS detections but didn't end up having a VIIRS raster
+
+What's going on with these 38 fires?  
+- 18 fires were too small to overlap with at least 2 VIIRS pixels (cut-off for rasterizing)  
+- 4 fires were large enough but didn't have at least 3 VIIRS detections (301175, 301238, CA3449011860020180922, NM3389010763620170706)  
+- for 8 fires, all the VIIRS detections occurred before the actual fire ignition date  
+- for 2 fires, once I dropped the pre-ignition VIIRS detections, there were less than 3 VIIRS points  
+- and then the rest were firedpy fires that overlapped with MTBS fires
+
+### conclusion - all omissions were legitimate
+
+
+
+## reproducible example
+For stackoverflow
+```{r}
+### dummy polygon
+# dummy_pol <- st_read("C:/Users/kjsie/Documents/fuel_treat_effects/polygon_dummy.shp")
+dummy_pol <- st_read("C:/Users/kjsie/Documents/fuel_treat_effects/new_dummy_polygon.shp")
+
+### subset viirs to match
+viirs_dummy <- st_intersection(test, dummy_pol)
+
+### drop cols
+viirs_dummy <- viirs_dummy %>%
+  dplyr::select(fire_date, geometry)
+
+### subset cbi to match
+cbi_crop <- st_crop(test_cbi, dummy_pol)
+dim(cbi_crop)
+
+### rasterize
+dummy_rast <- st_rasterize(viirs_dummy,
+                          st_as_stars(st_bbox(dummy_pol),
+                                      nx = 399,
+                                      ny = 460))
+
+###### CODE FOR STACK OVERFLOW
+### make dummy pol from scratch
+### set vertices
+polygon_vertices <- matrix(c(-1489008, 1369848,
+                             -1488191, 1370128,
+                             -1488132, 1369347,
+                             -1488985, 1369243,
+                             -1489008, 1369848),
+                           ncol = 2,
+                           byrow = TRUE)
+
+### make it a polygon
+polygon_test <- st_polygon(list(polygon_vertices))
+
+### make it an sf object and set the crs
+polygon_test <- polygon_test %>%
+  st_sfc(crs = 6350)
+
+ggplot() +
+  # geom_sf(data = polygon_test, fill = "lightblue") +
+    geom_sf(data = polygon_test, color = "gray") +
+  # geom_sf(data = dummy_pol, color = "red", fill = NA) +
+  geom_sf(data = viirs_dummy, aes(color = as.character(poly_no),
+                                  fill = as.character(fire_date)),
+          alpha = 0.2) +
+  NULL
+
+### make polygons for viirs
+### how to see the polygons?
+# polygeom <- st_geometry(viirs_dummy[1, ])
+# poly_coord <- st_coordinates(polygeom)
+# print(poly_coord)
+p1_vertices <- matrix(c(-1488355, 1369737,  
+                        -1488355, 1370072,  
+                        -1488237, 1370112, 
+                        -1488190, 1370112,
+                        -1488162, 1369737,
+                        -1488355, 1369737),
+                      ncol = 2, byrow = TRUE)
+p2_vertices <- matrix(c(-1488355, 1369737,  
+                        -1488355, 1370072,  
+                        -1488237, 1370112, 
+                        -1488190, 1370112,
+                        -1488162, 1369737,
+                        -1488355, 1369737),
+                      ncol = 2, byrow = TRUE)
+p3_vertices <- matrix(c(-1488253, 1369484,  
+                        -1488253, 1369859,  
+                        -1488171, 1369859, 
+                        -1488143, 1369484,
+                        -1488253, 1369484),
+                      ncol = 2, byrow = TRUE) 
+p4_vertices <- matrix(c(-1488292, 1369795,  
+                        -1488292, 1370093,  
+                        -1488191, 1370128, 
+                        -1488166, 1369795,
+                        -1488292, 1369795),
+                      ncol = 2, byrow = TRUE) 
+p5_vertices <- matrix(c(-1488260, 1369634,  
+                        -1488154, 1369634,  
+                        -1488132, 1369347, 
+                        -1488260, 1369332,
+                        -1488260, 1369634),
+                      ncol = 2, byrow = TRUE) 
+p6_vertices <- matrix(c(-1488255, 1369734,  
+                        -1488630, 1369734,  
+                        -1488630, 1369977, 
+                        -1488255, 1370106,
+                        -1488255, 1369734),
+                      ncol = 2, byrow = TRUE) 
+p7_vertices <- matrix(c(-1488240, 1369419,  
+                        -1488615, 1369419,  
+                        -1488615, 1369794, 
+                        -1488240, 1369794,
+                        -1488240, 1369419),
+                      ncol = 2, byrow = TRUE) 
+p8_vertices <- matrix(c(-1488212, 1370120,  
+                        -1488191, 1370128,  
+                        -1488190, 1370120, 
+                        -1488212, 1370120),
+                      ncol = 2, byrow = TRUE)
+p9_vertices <- matrix(c(-1488970, 1369519,  
+                        -1488995, 1369519,  
+                        -1489008, 1369848, 
+                        -1488970, 1369861,
+                        -1488970, 1369519),
+                      ncol = 2, byrow = TRUE) 
+p10_vertices <- matrix(c(-1488970, 1369519,  
+                        -1488995, 1369519,  
+                        -1489008, 1369848, 
+                        -1488970, 1369861,
+                        -1488970, 1369519),
+                      ncol = 2, byrow = TRUE) 
+p11_vertices <- matrix(c(-1488518, 1369823,  
+                         -1488518, 1370016,  
+                         -1488191, 1370128, 
+                         -1488168, 1369823,
+                         -1488518, 1369823),
+                       ncol = 2, byrow = TRUE)
+p12_vertices <- matrix(c(-1488452, 1369986,  
+                         -1488452, 1370039,  
+                         -1488191, 1370128, 
+                         -1488180, 1369986,
+                         -1488452, 1369986),
+                       ncol = 2, byrow = TRUE)
+p13_vertices <- matrix(c(-1488705, 1369618,  
+                         -1488999, 1369618,  
+                         -1489008, 1369848, 
+                         -1488705, 1369952,
+                         -1488705, 1369618),
+                       ncol = 2, byrow = TRUE) 
+p14_vertices <- matrix(c(-1488804, 1369607,  
+                         -1488999, 1369607,  
+                         -1489008, 1369848, 
+                         -1488804, 1369918,
+                         -1488804, 1369607),
+                       ncol = 2, byrow = TRUE)
+p15_vertices <- matrix(c(-1488921, 1369704,  
+                         -1489002, 1369704,  
+                         -1489008, 1369848, 
+                         -1488921, 1369878,
+                         -1488921, 1369704),
+                       ncol = 2, byrow = TRUE) 
+p16_vertices <- matrix(c(-1488299, 1369901,  
+                         -1488674, 1369901,  
+                         -1488674, 1369962, 
+                         -1488299, 1370091,
+                         -1488299, 1369901),
+                       ncol = 2, byrow = TRUE)  
+p17_vertices <- matrix(c(-1488904, 1369779,  
+                         -1489005, 1369779,  
+                         -1489008, 1369848, 
+                         -1488904, 1369884,
+                         -1488904, 1369779),
+                       ncol = 2, byrow = TRUE) 
+p18_vertices <- matrix(c(-1488525, 1369926,  
+                         -1488780, 1369926,  
+                         -1488525, 1370013, 
+                         -1488525, 1369926),
+                       ncol = 2, byrow = TRUE) 
+
+### combine into sf
+sf_df <- st_sf(
+  id = c(1:18),  # Unique identifier for each polygon
+  geometry = st_sfc(st_polygon(list(p1_vertices)),
+                    st_polygon(list(p2_vertices)),
+                    st_polygon(list(p3_vertices)),
+                    st_polygon(list(p4_vertices)),
+                    st_polygon(list(p5_vertices)),
+                    st_polygon(list(p6_vertices)),
+                    st_polygon(list(p7_vertices)),
+                    st_polygon(list(p8_vertices)),
+                    st_polygon(list(p9_vertices)),
+                    st_polygon(list(p10_vertices)),
+                    st_polygon(list(p11_vertices)),
+                    st_polygon(list(p12_vertices)),
+                    st_polygon(list(p13_vertices)),
+                    st_polygon(list(p14_vertices)),
+                    st_polygon(list(p15_vertices)),
+                    st_polygon(list(p16_vertices)),
+                    st_polygon(list(p17_vertices)),
+                    st_polygon(list(p18_vertices))),
+  crs = 6350)
+
+
+ggplot() +
+  # geom_sf(data = polygon_test, fill = "lightblue") +
+    geom_sf(data = polygon_test, color = "gray") +
+  # geom_sf(data = dummy_pol, color = "red", fill = NA) +
+  geom_sf(data = sf_df, aes(color = as.character(id),
+                                  fill = as.character(id)),
+          alpha = 0.2) +
+  NULL
+
+### rasterize
+dummy_rast <- st_rasterize(sf_df,
+                          st_as_stars(st_bbox(polygon_test),
+                                      nx = 399,
+                                      ny = 460))
+
+plot(dummy_rast)
+```

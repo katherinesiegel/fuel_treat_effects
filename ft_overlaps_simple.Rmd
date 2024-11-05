@@ -1,0 +1,444 @@
+---
+title: "ft_overlaps_simple"
+output: html_document
+date: "2024-02-02"
+---
+
+## Description
+Pick up from chunk labeled "Intersect with fires" in ft_overlaps.Rmd and try a simpler approach to getting fuel treatment history at each point
+
+## Set up
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+### Load packages
+library(tidyverse)
+library(sf)
+library(lubridate)
+library(raster)
+library(terra)
+# library(viridis)
+# library(scales)
+library(lwgeom)
+library(googledrive)
+# library(furrr)
+# library(sfheaders)
+library(units)
+```
+
+### Prep burned ft data
+```{r}
+### open data
+burned_ft <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/all_burned_fuel_treats_year_burned_polygons.shp")
+
+### get col names
+colnam <- c("ft_id", "state", "activity_code", "activity", "treatment", "treatment_name",
+            "date_comp", "day_comp", "month_comp", "year_comp",
+            "first_fire_id", "first_fire_source", "fire_ig_date", "fire_id",
+            "fire_year", "start_day", "end_day", "geometry")
+
+### rename cols
+colnames(burned_ft) <- colnam
+
+### classify treatment types
+rx_fuel_treat <- c("1111", "1112", "1113", "2540")
+other_fire_fuel_treat <- "1130"
+mech_fuel_treat <- c("1136", "1139", "1150", "1152", "1153", 
+                     "1154", "1160", "1180", "2370", "4455")
+rx_non_ft <- c("4471", "4491", "4541", "6101", "7050")
+other_fire_non_ft <- "1102"
+mech_non_ft <- c("1120", "2341", "2360", "2510", "2530", "4111", 
+                 "4113", "4115", "4117", "4121", "4131", "4132", 
+                 "4142", "4143", "4146", "4151", "4152", "4177", 
+                 "4183", "4193", "4194", "4210", "4211", "4220", 
+                 "4231", "4232", "4241", "4242", "4270", "4471", 
+                 "4473", "4474", "4475", "4493", "4494", "4495", 
+                 "4511", "4521", "4530", "4540", "6103", '6107', 
+                 "7065", "7067", "9008", "9400")
+
+### add column for overall treatment type
+burned_ft <- burned_ft %>%
+  mutate(overall_treat_type = ifelse(activity_code %in% mech_non_ft,
+                                     "mech_non_ft",
+                                     ifelse(activity_code %in% other_fire_non_ft,
+                                            "other_fire_non_ft",
+                                            ifelse(activity_code %in% rx_non_ft,
+                                                   "rx_non_ft",
+                                                   ifelse(activity_code %in% mech_fuel_treat,
+                                                          "mech_fuel_treat",
+                                                          ifelse(activity_code %in% other_fire_fuel_treat,
+                                                                 "other_fire_fuel_treat",
+                                                                 ifelse(activity_code %in% rx_fuel_treat,
+                                                                        "rx_fuel_treat",
+                                                                        "other")))))))
+
+### remove Planned Treatment Burned in Wildfire, Wildfire - Human Ignition, and Wildfire - Natural Ignition 
+burned_ft <- burned_ft %>%
+  filter(!activity_code %in% c("1119", "4472", "1117", "1118"))
+
+### treated for fuel vs not treated for fuel
+burned_ft <- burned_ft %>%
+  mutate(treat_for_fuel = ifelse(overall_treat_type %in% c("mech_fuel_treat",
+                                                           "other_fire_fuel_treat",
+                                                           "rx_fuel_treat",
+                                                           "other_fire_non_ft"),
+                                 "treat_for_fuel",
+                                 "non_fuel_treat"))
+
+### also make it numeric
+burned_ft <- burned_ft %>%
+  mutate(tff_num = ifelse(treat_for_fuel == "treat_for_fuel", 1, 0))
+```
+
+### unsuccessful code
+### combine
+Could I loop through fires and union polygons?
+```{r}
+### make vector of unique fires
+fire_vector <- unique(burned_ft$first_fire_id)
+
+### make output df
+output_list <- list()
+
+### loop
+for (i in 1:length(fire_vector)) {
+  
+  ### get the first fire
+  temp_fire <- fire_vector[i]
+  
+  ### subset burned_ft to that fire
+  temp_fts <- burned_ft %>%
+    filter(first_fire_id == temp_fire)
+  
+  # ### separate them
+  # temp_fts <- temp_fts %>%
+  #   st_cast("POLYGON")
+  
+  ### this gives me a list
+  # ### combine
+  # comb_fts <- temp_fts %>%
+  #   st_union() #%>%
+  #  # st_cast("POLYGON")
+  
+  # comb_fts <- do.call(rbind, comb_fts)
+  
+  ### intersect them
+  # intersect_fts <- st_intersection(temp_fts)
+  intersect_fts <- st_join(temp_fts, temp_fts, st_intersects)
+  
+  # ### drop non-intersections
+  # intersect_fts <- intersect_fts %>%
+  #   filter(n.overlaps > 1) %>%
+  #   st_collection_extract()
+    
+    temp_fts %>%
+    st_intersection() %>%
+    ### don't want lines
+    st_collection_extract()
+  
+  ### non-intersections
+  non_intersect <- rmapshaper::ms_erase(temp_fts, intersect_fts)
+  
+}
+
+
+ggplot() +
+  geom_sf(data = temp_fts, aes(color = ft_id, fill = treat_for_fuel ), alpha = 0.2)
+
+ggplot() +
+  geom_sf(data = comb_fts)
+
+ggplot() +
+  geom_sf(data = intersect_fts, fill = "gray", alpha = 0.2) +
+  geom_sf(data = intersect_fts_split, fill = "lightblue", alpha = 0.6)
+
+
+```
+
+
+
+
+### extract data to points for one fire
+```{r}
+### open fire pts
+pts <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/cbi_pts_mtbs.shp")
+
+### filter to one fire
+pts_1 <- pts %>%
+  filter(fire_id == "ID4485611430720180802")
+
+### subset burned_fts to fire
+burned_fire <- burned_ft %>%
+  filter(first_fire_id %in% pts_1$fire_id)
+
+### intersect them
+pts_ft <- st_intersection(pts_1, burned_fire)
+
+### summarize
+pts_ft_summ <- pts_ft
+st_geometry(pts_ft_summ) <- NULL
+
+# ### what does this look like?
+# summ_n <- pts_ft_summ %>%
+#   group_by(uid) %>%
+#   summarise(n_occurrences = n())
+# 
+# ### merge
+# pts_ft_summ <- merge(pts_ft_summ, summ_n, by = "uid")
+# 
+# ### look at the points that show up more than once
+# pts_check <- pts_ft_summ %>%
+#   filter(n_occurrences > 1)
+# pts_check <- pts_ft_summ %>%
+#   filter(uid %in% pts_check$uid)
+# 
+# ### are any of the fuel treatments after the fire?
+# pts_check <- pts_check %>%
+#   mutate(wrong_order = ifelse(date_comp > fire_ig_date, 1, 0))
+# ### no, none are in the wrong order
+# pts_check$wrong_order <- NULL
+
+### add row number within each 
+pts_ft_summ <- pts_ft_summ %>%
+  group_by(uid) %>%
+  mutate(rowid = row_number())
+
+### simplify columns
+pts_ft_summ <- pts_ft_summ %>%
+  dplyr::select(uid, fire_id, rowid, ft_id, activity_code, activity,
+                treatment, date_comp, first_fire_id, fire_ig_date,
+                overall_treat_type, treat_for_fuel, tff_num)
+
+### try making it wider?
+pts_ft_summ <- pts_ft_summ %>%
+  pivot_wider(names_from = rowid,
+              values_from = c(ft_id,
+                              activity_code,
+                              activity,
+                              treatment,
+                              date_comp,
+                              first_fire_id,
+                              fire_ig_date,
+                              overall_treat_type,
+                              treat_for_fuel,
+                              tff_num))
+
+### this seems to work!
+```
+
+### extract data to points for sample fires
+```{r}
+### loop through fires to intersect
+
+### make output object
+pts_in_fts <- list()
+
+### make vector of fires
+unique_fires <- unique(pts$fire_id)
+
+### loop
+for (i in 1:length(unique_fires)) {
+  
+  ### get fire
+  fire_i <- unique_fires[i]
+  
+  ### get pts
+  pts_i <- pts %>%
+    filter(fire_id %in% fire_i)
+  
+  ### get fts
+  fts_i <- burned_ft %>%
+    filter(first_fire_id %in% fire_i)
+  
+  ### intersect them
+  pts_inter_i <- st_intersection(pts_i, fts_i)
+  
+  ### write to list
+  pts_in_fts[[i]] <- pts_inter_i
+  
+}
+
+### get out of list form
+pts_df <- do.call(rbind, pts_in_fts)
+
+rm(pts_in_fts)
+gc()
+
+# ### are any of the fuel treatments after the fire?
+# pts_df_check <- pts_df %>% 
+#   mutate(wrong = ifelse(date_comp > fire_ig_date, 1, 0)) %>% 
+#   filter(wrong > 0)
+### nope
+
+### drop geometry
+st_geometry(pts_df) <- NULL
+
+### add row number within each 
+pts_df <- pts_df %>%
+  group_by(uid) %>%
+  mutate(rowid = row_number())
+
+### simplify columns
+pts_df <- pts_df %>%
+  dplyr::select(uid, fire_id, rowid, ft_id, activity_code, activity,
+                treatment, date_comp, first_fire_id, fire_ig_date,
+                overall_treat_type, treat_for_fuel, tff_num)
+
+### try making it wider?
+pts_df <- pts_df %>%
+  pivot_wider(names_from = rowid,
+              values_from = c(ft_id,
+                              activity_code,
+                              activity,
+                              treatment,
+                              date_comp,
+                              first_fire_id,
+                              fire_ig_date,
+                              overall_treat_type,
+                              treat_for_fuel,
+                              tff_num))
+
+### this seems to work!
+
+### now need to add the pts that didn't intersect with any treatments back in
+
+### make pts a normal df
+st_geometry(pts) <- NULL
+
+### merge
+pts_all <- merge(x = pts,
+                 y = pts_df,
+                 by = c("uid", "fire_id"),
+                 all = TRUE)
+
+### write out
+write_csv(pts_all,
+          "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/pts_trial_fts.csv")
+```
+
+### determine which points should be dropped
+Want to drop points that only received non-fuel treatments FTs, since these will not be appropriate control points
+```{r}
+### open pts
+pts_all <- read.csv("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/pts_trial_fts.csv")
+
+### sum tff columns
+pts_all <- pts_all %>%
+  rowwise() %>%
+  mutate(tff_all = sum(tff_num_1, tff_num_2, tff_num_3, tff_num_4,
+                       tff_num_5, tff_num_6, tff_num_7,
+                       na.rm = TRUE))
+
+### classify
+pts_all <- pts_all %>%
+  mutate(category = ifelse(tff_all > 0, "treated",
+                           ifelse((is.na(tff_num_1) & is.na(tff_num_2) & is.na(tff_num_3) 
+                                   & is.na(tff_num_4) & is.na(tff_num_5) & is.na(tff_num_6) & is.na(tff_num_7)),
+                                  "control", "drop")))
+
+# check <- pts_all %>% dplyr::select(uid, tff_num_1:category)
+
+### what's the breakdown?
+table(pts_all$category)
+
+# control    drop treated 
+# 1709226   14027   46779 
+
+### drop the drops
+# pts_all <- pts_all %>%
+#   filter(! category == "drop")
+
+### simplify for csv
+pts_all <- pts_all %>%
+  dplyr::select(uid, category)
+
+### write out
+write_csv(pts_all,
+          "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/pts_treat_control.csv")
+```
+
+### breakdown by fire
+```{r}
+### open pts
+pts_all <- read_csv("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/pts_trial_fts.csv") %>%
+  dplyr::select(.,
+                uid, fire_id)
+
+### open treated pts
+treat_control <- read.csv("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/pts_treat_control.csv")
+
+### merge
+pts_all <- merge(pts_all,
+                 treat_control,
+                 by = "uid",
+                 all.x = TRUE)
+
+### summarize by fire
+fire_summ <- pts_all %>%
+  group_by(fire_id, category) %>%
+  summarise(n_pts = n())
+```
+
+
+### simplify treated pts
+```{r}
+### open pts
+pts_all <- read_csv("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/pts_trial_fts.csv")
+
+### open treated pts
+treat_control <- read.csv("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/pts_treat_control.csv") %>%
+  filter(., category == "treated")
+
+### filter pts_all to treated points
+pts_all <- pts_all %>%
+  filter(uid %in% treat_control$uid)
+
+### clean up
+rm(treat_control)
+gc()
+
+### what's the breakdown of the number of fuel treatments?
+pts_all$n_na <- rowSums(is.na(pts_all))  
+pts_all <- pts_all %>%
+  mutate(n_ft = 7 - n_na/10)
+table(pts_all$n_ft)
+ #    1     2     3     4     5     6     7 
+ # 8708  9567 23506  3392  1475   119    12
+
+### see date range of treatments
+pts_all <- pts_all %>%
+  rowwise() %>%
+  mutate(earliest_ft = min(date_comp_1, date_comp_2, date_comp_3, date_comp_4,
+                           date_comp_5, date_comp_6, date_comp_7,
+                           na.rm = TRUE),
+         latest_ft = max(min(date_comp_1, date_comp_2, date_comp_3, date_comp_4,
+                             date_comp_5, date_comp_6, date_comp_7,
+                             na.rm = TRUE)),
+         earliest_fire = min(fire_ig_date_1, fire_ig_date_2, fire_ig_date_3, fire_ig_date_4,
+                             fire_ig_date_5, fire_ig_date_6, fire_ig_date_7,
+                             na.rm = TRUE),
+         latest_fire = max(min(fire_ig_date_1, fire_ig_date_2, fire_ig_date_3, fire_ig_date_4,
+                               fire_ig_date_5, fire_ig_date_6, fire_ig_date_7,
+                               na.rm = TRUE)))
+
+# ### days between first and last treatment
+# pts_all$days_btw_ft <- difftime(pts_all$earliest_ft,
+#                                 pts_all$latest_ft,
+#                                 units = c("days"))
+# 
+# ### what's the breakdown
+# table(pts_all$same_date_ft)
+
+# ### check it out
+# pts_check <- pts_all %>%
+#   dplyr::select(uid, earliest_fire, latest_fire,
+#                 earliest_ft, latest_ft)
+
+pts_check <- pts_all %>%
+  dplyr::select(uid, fire_ig_date_1, fire_ig_date_2, fire_ig_date_3, fire_ig_date_4,
+                fire_ig_date_5, fire_ig_date_6, fire_ig_date_7,
+                date_comp_1, date_comp_2, date_comp_3, 
+                date_comp_4, date_comp_5, date_comp_6, date_comp_7)
+
+```
+

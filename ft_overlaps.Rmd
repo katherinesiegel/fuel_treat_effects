@@ -1,0 +1,5571 @@
+---
+title: "ft_overlaps"
+output: html_document
+date: "2023-11-09"
+---
+
+## Description
+Picks up after west_us.Rmd
+
+## NOTES
+Need to re-do sample pts sf df to include year of fire and year_prior for GEE land cover export! And also a uid for the sample pts -- can be based on fire id then nrow
+
+Could rasterize shapefiles of fuel treatments with terra::rasterize. Argument cover gives % of each pixel that is inside the polygon -- this would let me filter out pixels that are intersected by the boundary of the fuel treatment
+
+https://search.r-project.org/CRAN/refmans/terra/html/rasterize.html
+
+## Set up
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+### Load packages
+library(tidyverse)
+library(sf)
+library(lubridate)
+library(raster)
+library(terra)
+# library(viridis)
+# library(scales)
+library(lwgeom)
+library(googledrive)
+# library(furrr)
+# library(sfheaders)
+library(units)
+```
+
+## Overlapping fuel treatments
+```{r warning = FALSE}
+### open shp of burned FTs
+burned_ft <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/all_burned_fuel_treats_year_updated_polygons.shp")
+
+### open csv for firedpy
+fp <- read.csv("E:/usda_2023/usfs_fuel_treatments/western_us/firedpy_ft_burned_all.csv")
+
+### open csv for mtbs
+mtbs_fts <- read.csv("E:/usda_2023/usfs_fuel_treatments/western_us/all_burned_fts_w_us_updated.csv") %>%
+  
+  ### fix ignition date
+  mutate(Ig_Date = make_date(year, month, date))
+
+### rename cols for both csvs
+fp <- fp %>%
+  dplyr::select(ft_id, 
+                firedpy_id = id,
+                firedpy_ig_date = ig_date,
+                firedpy_ig_day = ig_day,
+                firedpy_ig_month = ig_mnth,
+                firedpy_ig_year = ig_year)
+mtbs_fts <- mtbs_fts %>%
+  dplyr::select(ft_id, 
+                mtbs_id = Event_ID,
+                mtbs_ig_date = Ig_Date,
+                mtbs_ig_day = date,
+                mtbs_ig_month = month,
+                mtbs_ig_year = year)
+
+### merge in data
+burned_mtbs <- merge(x = burned_ft,
+                     y = mtbs_fts,
+                     by = "ft_id",
+                     all.x = TRUE)
+burned_m_p <- merge(x = burned_mtbs,
+                    y = fp,
+                    by = "ft_id",
+                    all.x = TRUE) 
+
+### clean up intermediate files
+rm(burned_mtbs, mtbs_fts, fp)
+
+### double check that fires happened AFTER treatment
+burned_m_p <- burned_m_p %>%
+  mutate(interval_mtbs = round(as.numeric(difftime(DATE_COMPL,
+                                                       mtbs_ig_date, units = "days"))),
+         interval_fp = round(as.numeric(difftime(DATE_COMPL,
+                                                       firedpy_ig_date, units = "days"))))
+
+### are any of these values positive?
+range(burned_m_p$interval_mtbs, na.rm = TRUE)
+range(burned_m_p$interval_fp, na.rm = TRUE)
+### nope. that's good!
+
+### how many treatments burned in both an mtbs fire and a firedpy fire?
+burned_both <- burned_m_p %>%
+  filter(!is.na(mtbs_id)) %>%
+  filter(!is.na(firedpy_id))
+st_geometry(burned_both) <- NULL
+burned_both <- burned_both %>%
+  distinct()
+### 457 treatments
+
+### drop interval cols
+burned_m_p <- burned_m_p %>%
+  dplyr::select(-interval_mtbs,
+                -interval_fp)
+
+### figure out which fire was first
+burned_m_p <- burned_m_p %>%
+  mutate(int_mtbs = round(as.numeric(difftime(mtbs_ig_date,
+                                                  firedpy_ig_date, 
+                                              units = "days"))))
+### negative value means that MTBS fire happened first
+### positive value means that firedpy fire happened first
+
+### id first fire
+burned_m_p <- burned_m_p %>%
+  mutate(first_fire_id = ifelse(is.na(int_mtbs) & is.na(firedpy_id),
+                                mtbs_id,
+                                ifelse(is.na(int_mtbs) & is.na(mtbs_id),
+                                       firedpy_id,
+                                       ifelse(int_mtbs < 0, mtbs_id, firedpy_id))),
+         first_fire_source = ifelse(is.na(int_mtbs) & is.na(firedpy_id),
+                                "mtbs",
+                                ifelse(is.na(int_mtbs) & is.na(mtbs_id),
+                                       "firedpy",
+                                       ifelse(int_mtbs < 0, "mtbs", "firedpy"))))
+
+### add ignition date info for first fire
+burned_m_p <- burned_m_p %>%
+  mutate(fire_ig_date = ifelse(first_fire_source == "mtbs",
+                               as.character(mtbs_ig_date),
+                               firedpy_ig_date))
+
+### clean up
+burned_m_p <- burned_m_p %>%
+  dplyr::select(ft_id, 
+                STATE_ABBR, 
+                ACTIVITY_C, 
+                ACTIVITY, 
+                TREATMENT_, 
+                TREATMENT1,
+                DATE_COMPL, date_comp, month_comp, year_comp,
+                first_fire_id,
+                first_fire_source,
+                fire_ig_date,
+                geometry)
+
+### write out
+st_write(burned_m_p,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/all_burned_fuel_treats_year_updated_polygons_fireID.shp")
+
+### THESE ARE FOR THE FULL FUEL TREATMENTS -- THERE COULD BE PARTS OF THE FUEL TREATMENT THAT BURNED IN MTBS BUT NOT IN FIREDPY and VICE VERSA
+  
+```
+
+#### look at an example
+```{r}
+### look at one example: ft_id = 8358
+ex_ft <- burned_m_p %>%
+  filter(ft_id == "8358") 
+
+### get fire perimeters
+mtbs_all <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/mtbs_west.shp") %>%
+  filter(., Event_ID %in% ex_ft$mtbs_id)
+firedpy <- st_read("E:/fired_py_data/fired_west_events.shp") %>%
+  filter(., id %in% ex_ft$firedpy_id) %>%
+  st_transform(., 6350)
+
+### plot
+ggplot() +
+  geom_sf(data = ex_ft) +
+  geom_sf(data = mtbs_all, aes(color = Event_ID), fill = NA) +
+  geom_sf(data = firedpy, aes(color = as.character(id)), fill = NA)
+
+########
+### another example: 24334
+ex_ft <- burned_m_p %>%
+  filter(ft_id == "24334") 
+
+### get fire perimeters
+mtbs_all <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/mtbs_west.shp") %>%
+  filter(., Event_ID %in% ex_ft$mtbs_id)
+firedpy <- st_read("E:/fired_py_data/fired_west_events.shp") %>%
+  filter(., id %in% ex_ft$firedpy_id) %>%
+  st_transform(., 6350)
+
+### plot
+ggplot() +
+  geom_sf(data = ex_ft, fill = NA) +
+  geom_sf(data = mtbs_all, aes(color = Event_ID), fill = NA) +
+  geom_sf(data = firedpy, aes(color = as.character(id)), fill = NA)
+
+```
+
+## Intersect with fires
+Want the polygon that actually burned in each fuel treatment
+```{r, warning = FALSE}
+### open fire perimeter polygons
+fp <- st_read("E:/fired_py_data/fired_west_events.shp") %>%
+  filter(., id %in% burned_m_p$first_fire_id) %>%
+  st_transform(., 6350) %>%
+  dplyr::select(., Fire_ID = id,
+                Fire_Year = ig_year,
+                Start_Day = ig_month, 
+                End_Day = ig_day,
+                geometry)
+mt <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/mtbs_gee.shp") %>%
+  filter(., Fire_ID %in% burned_m_p$first_fire_id) %>%
+  dplyr::select(., -Incid_Type)
+
+### rbind fires
+all_fires <- rbind(fp, mt)
+rm(fp, mt)
+gc()
+
+### loop and get actual burned polygon
+store_burned <- list()
+for (i in 1:nrow(burned_m_p)) {
+  
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get treatment i
+  tr_temp <- burned_m_p[i, ]
+  
+  ### subset to fires that burned after
+  fire_temp <- all_fires %>%
+    filter(Fire_ID %in% tr_temp$first_fire_id)
+  
+  ### Intersect
+  temp_intersect <- st_intersection(tr_temp, fire_temp)
+  
+  ### store intersections as a list
+  store_burned[[i]] <- list(temp_intersect, unique(burned_m_p$ft_id)[i])
+}
+rm(burned_mp, all_fires)
+gc()
+
+### df for unlisting: temp_intersect_join
+temp_intersect_join <- temp_intersect
+
+for (i in 1:length(store_burned)) {
+  # for (i in 1:10) { ## make sure it works on subset of data
+  
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### make df
+  # temp_data <- as.data.frame(store_burned[[i]][[1]])
+  temp_data <- store_burned[[i]][[1]]
+  
+  if(nrow(temp_data) > 0) {
+    
+    ### rbind with adj_treat_burn
+    temp_intersect_join <- rbind(temp_intersect_join,
+                                 temp_data)
+  } 
+  
+}
+
+### drop copied row
+temp_intersect_join <- temp_intersect_join %>%
+  distinct()
+
+### write out
+st_write(temp_intersect_join,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/all_burned_fuel_treats_year_burned_polygons.shp")
+
+# ### version for GEE
+# temp_intersect_join <- temp_intersect_join %>%
+#   dplyr::select(ft_id, state = STATE_A,
+#                 date_comp = DATE_CO,
+#                 year_comp = yer_cmp,
+#                 fire_year = Fire_Yr)
+# st_write(temp_intersect_join,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/burned_ft_gee.shp")
+
+### clean up
+rm(burned_m_p, fire_temp, store_burned,
+   temp_data, temp_intersect,
+   tr_temp)
+gc()
+```
+
+
+## Intersect overlaps
+```{r}
+### see breakdown by state
+table(temp_intersect_join$STATE_ABBR)
+
+# AZ   CA   CO    ID   MT   NM    NV   OR   UT   WA   WY 
+# 1114 9492 1077  906  704  262   57  5736  196 1252  584 
+```
+
+For each footprint, I want to know if another footprint overlaps it. So the output I want is a df with a column for ft_id 1, ft_id 2, and true/false whether they overlap.
+
+#### nevada
+```{r, warning=FALSE}
+### subset to NV
+test_neva <- temp_intersect_join %>%
+  filter(STATE_ABBR == "NV")
+rm(temp_intersect_join)
+gc()
+
+### make two sf dfs for dummy df
+nv_1 <- test_neva %>%
+  filter(ft_id == "87244")
+nv_2 <- test_neva %>%
+  filter(ft_id == "421221")
+
+### intersect two to make dummy df
+ft_fill <- st_intersection(nv_1,
+                           nv_2)
+
+### change columns for dummy df
+ft_fill <- ft_fill %>%
+  dplyr::select(ft_id_1 = ft_id, 
+                state_1 = STATE_ABBR,
+                activity_1 = ACTIVITY,
+                date_compl_1 = DATE_COMPL,
+                fire_1 = first_fire_id,
+                fire_source_1 = first_fire_source,
+                fire_ig_1 = fire_ig_date,
+                ft_id_2 = ft_id.1,
+                state_2 = STATE_ABBR.1,
+                activity_2 = ACTIVITY.1,
+                date_compl_2 = DATE_COMPL.1,
+                fire_2 = first_fire_id.1,
+                fire_source_2 = first_fire_source.1,
+                fire_ig_2 = fire_ig_date.1,
+                geometry)
+
+# i <- 1
+### make loop
+for (i in 1:nrow(test_neva)) {
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get polygon
+  temp_1 <- test_neva[i, ] %>%
+    dplyr::select(ft_id_1 = ft_id, 
+                state_1 = STATE_ABBR,
+                activity_1 = ACTIVITY,
+                date_compl_1 = DATE_COMPL,
+                fire_1 = first_fire_id,
+                fire_source_1 = first_fire_source,
+                fire_ig_1 = fire_ig_date,
+                geometry)
+  
+  ### filter dataset by the state of interest
+  test_state <- test_neva %>%
+    filter(STATE_ABBR == temp_1$state_1)
+  
+  # for (j in 2:(nrow(test_state)-1)) {
+    for (j in (i+1):(nrow(test_state))) {
+    
+    ### get polygon 2
+    temp_2 <- test_state[j, ] %>%
+      dplyr::select(ft_id_2 = ft_id,
+                    state_2 = STATE_ABBR,
+                    activity_2 = ACTIVITY,
+                    date_compl_2 = DATE_COMPL,
+                    fire_2 = first_fire_id,
+                    fire_source_2 = first_fire_source,
+                    fire_ig_2 = fire_ig_date,
+                    geometry)
+    
+    # if(temp_1$ft_id_1 != temp_2$ft_id_2) {
+      
+      ### intersect
+      temp_overlap <- st_intersection(temp_1,
+                                      temp_2)
+      
+      # ### store intersections as a list
+      # store_overlaps[j] <- temp_overlap
+      
+      ### add to df
+      ft_fill <- rbind(ft_fill,
+                       temp_overlap)
+    # }
+    
+  }
+  
+}
+
+### remove dup row
+ft_fill <- ft_fill %>%
+  distinct()
+
+### make valid
+ft_fill <- st_make_valid(ft_fill)
+
+# ### add area
+# ft_fill$area_overlap <- as.numeric(sf::st_area(ft_fill))
+
+# ### remove problem geoms
+# ft_fill <- ft_fill %>%
+#   filter(area_overlap > 905)
+
+### write out
+# st_write(ft_fill,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_neva_updated2.shp")
+### can't write this out: Failed to create feature 0 in fuel_treat_overlaps_neva_updated2
+
+### fix problem shapes
+ft_fill_split <- ft_fill %>%
+  st_collection_extract()
+
+### what is this doing?
+# 87244
+# NV
+# Burning of Piled Material
+# 2015-11-20
+# NV3925811988320161014
+# mtbs
+# 2016-10-14
+# 421221
+
+### check with one row from ft_fill
+check <- ft_fill %>%
+   filter(ft_id_1 == "87244" & ft_id_2 == "421221")
+ggplot() +
+  geom_sf(data = check)
+check_2 <- ft_fill_split %>%
+  filter(ft_id_1 == "87244" & ft_id_2 == "421221")
+ggplot() +
+  geom_sf(data = check)
+### splits GEOMETRY COLLECTIONS to individual objects
+
+### are any of the objects just dropped?
+length(unique(ft_fill$ft_id_1))
+length(unique(ft_fill_split$ft_id_1))
+### yes, looks like there is a ft_id_1 that is dropped
+check <- ft_fill %>%
+  filter(!ft_id_1 %in% ft_fill_split$ft_id_1)
+ggplot() +
+  geom_sf(data = check)
+### the one that gets dropped is a MULTILINESTRING
+
+# write out
+st_write(ft_fill_split,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_neva_updated2.shp")
+
+### clean up
+rm(ft_fill, ft_fill_split, temp_1,
+   temp_2, temp_overlap, test_neva, test_state)
+gc()
+```
+
+#### utah
+```{r, warning=FALSE}
+### open burned fts
+burned_ft <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/all_burned_fuel_treats_year_burned_polygons.shp") %>%
+  dplyr::select(.,
+                ft_id = ft_id, 
+                STATE_ABBR = STATE_A, 
+                ACTIVITY = ACTIVITY,
+                DATE_COMPL = DATE_CO, 
+                first_fire_id = frst_fr_d, 
+                first_fire_source = frst_fr_s,
+                fire_ig_date = fr_g_dt, 
+                geometry)
+
+### subset to UT
+utah <- burned_ft %>%
+  filter(STATE_ABBR == "UT")
+rm(burned_ft)
+gc()
+
+### intersect two to make dummy df
+ft_fill <- st_intersection(nv_1,
+                           nv_2)
+
+### change columns for dummy df
+ft_fill <- ft_fill %>%
+  dplyr::select(ft_id_1 = ft_id, 
+                state_1 = STATE_ABBR,
+                activity_1 = ACTIVITY,
+                date_compl_1 = DATE_COMPL,
+                fire_1 = first_fire_id,
+                fire_source_1 = first_fire_source,
+                fire_ig_1 = fire_ig_date,
+                ft_id_2 = ft_id.1,
+                state_2 = STATE_ABBR.1,
+                activity_2 = ACTIVITY.1,
+                date_compl_2 = DATE_COMPL.1,
+                fire_2 = first_fire_id.1,
+                fire_source_2 = first_fire_source.1,
+                fire_ig_2 = fire_ig_date.1,
+                geometry)
+
+# i <- 1
+### make loop
+for (i in 1:nrow(utah)) {
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get polygon
+  temp_1 <- utah[i, ] %>%
+    dplyr::select(ft_id_1 = ft_id, 
+                state_1 = STATE_ABBR,
+                activity_1 = ACTIVITY,
+                date_compl_1 = DATE_COMPL,
+                fire_1 = first_fire_id,
+                fire_source_1 = first_fire_source,
+                fire_ig_1 = fire_ig_date,
+                geometry)
+  
+  ### filter dataset by the state of interest
+  test_state <- utah %>%
+    filter(STATE_ABBR == temp_1$state_1)
+  
+  for (j in (i+1):(nrow(test_state))) {
+    
+    ### get polygon 2
+    temp_2 <- test_state[j, ] %>%
+      dplyr::select(ft_id_2 = ft_id,
+                    state_2 = STATE_ABBR,
+                    activity_2 = ACTIVITY,
+                    date_compl_2 = DATE_COMPL,
+                    fire_2 = first_fire_id,
+                    fire_source_2 = first_fire_source,
+                    fire_ig_2 = fire_ig_date,
+                    geometry)
+  
+      ### intersect
+      temp_overlap <- st_intersection(temp_1,
+                                      temp_2)
+      
+      # ### store intersections as a list
+      # store_overlaps[j] <- temp_overlap
+      
+      ### add to df
+      ft_fill <- rbind(ft_fill,
+                       temp_overlap)
+    
+  }
+  
+}
+
+### remove dup row
+ft_fill <- ft_fill %>%
+  distinct()
+
+### make valid
+ft_fill <- st_make_valid(ft_fill)
+
+### fix problem shapes
+ft_fill_split <- ft_fill %>%
+  st_collection_extract()
+
+# ### are any of the objects just dropped?
+# length(unique(ft_fill$ft_id_1))
+# length(unique(ft_fill_split$ft_id_1))
+# ### yes, several ft_id_1 are dropped
+# check <- ft_fill %>%
+#   filter(!ft_id_1 %in% ft_fill_split$ft_id_1)
+# check[3, ] %>%
+#   ggplot() +
+#   geom_sf()
+# ### the ones that get dropped are LINESTRINGs, MULTILINESTRINGs, and POINTs
+
+### write out
+st_write(ft_fill_split,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_utah_updated2.shp")
+
+### clean up
+rm(utah, ft_fill_split, ft_fill, 
+   temp_1, temp_2, temp_overlap, test_state)
+gc()
+```
+
+#### new mexico
+```{r, warning=FALSE}
+### open burned fts
+nmex <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/all_burned_fuel_treats_year_burned_polygons.shp") %>%
+  dplyr::select(.,
+                ft_id = ft_id, 
+                STATE_ABBR = STATE_A, 
+                ACTIVITY = ACTIVITY,
+                DATE_COMPL = DATE_CO, 
+                first_fire_id = frst_fr_d, 
+                first_fire_source = frst_fr_s,
+                fire_ig_date = fr_g_dt, 
+                geometry) %>%
+  filter(., STATE_ABBR == "NM")
+
+### intersect two to make dummy df
+ft_fill <- st_intersection(nv_1,
+                           nv_2)
+
+### change columns for dummy df
+ft_fill <- ft_fill %>%
+  dplyr::select(ft_id_1 = ft_id, 
+                state_1 = STATE_ABBR,
+                activity_1 = ACTIVITY,
+                date_compl_1 = DATE_COMPL,
+                fire_1 = first_fire_id,
+                fire_source_1 = first_fire_source,
+                fire_ig_1 = fire_ig_date,
+                ft_id_2 = ft_id.1,
+                state_2 = STATE_ABBR.1,
+                activity_2 = ACTIVITY.1,
+                date_compl_2 = DATE_COMPL.1,
+                fire_2 = first_fire_id.1,
+                fire_source_2 = first_fire_source.1,
+                fire_ig_2 = fire_ig_date.1,
+                geometry)
+
+### make loop
+for (i in 1:nrow(nmex)) {
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get polygon
+  temp_1 <- nmex[i, ] %>%
+    dplyr::select(ft_id_1 = ft_id, 
+                state_1 = STATE_ABBR,
+                activity_1 = ACTIVITY,
+                date_compl_1 = DATE_COMPL,
+                fire_1 = first_fire_id,
+                fire_source_1 = first_fire_source,
+                fire_ig_1 = fire_ig_date,
+                geometry)
+  
+  ### filter dataset by the state of interest
+  test_state <- nmex %>%
+    filter(STATE_ABBR == temp_1$state_1)
+  
+  for (j in (i+1):(nrow(test_state))) {
+    
+    ### get polygon 2
+    temp_2 <- test_state[j, ] %>%
+      dplyr::select(ft_id_2 = ft_id,
+                    state_2 = STATE_ABBR,
+                    activity_2 = ACTIVITY,
+                    date_compl_2 = DATE_COMPL,
+                    fire_2 = first_fire_id,
+                    fire_source_2 = first_fire_source,
+                    fire_ig_2 = fire_ig_date,
+                    geometry)
+    
+      ### intersect
+      temp_overlap <- st_intersection(temp_1,
+                                      temp_2)
+      
+      # ### store intersections as a list
+      # store_overlaps[j] <- temp_overlap
+      
+      ### add to df
+      ft_fill <- rbind(ft_fill,
+                       temp_overlap)
+    }
+  
+}
+
+### remove neva dup row
+ft_fill <- ft_fill %>%
+  filter(state_1 == "NM")
+
+### make valid
+ft_fill <- st_make_valid(ft_fill)
+
+### fix problem shapes
+ft_fill_split <- ft_fill %>%
+  st_collection_extract()
+
+### are any of the objects just dropped?
+length(unique(ft_fill$ft_id_1))
+length(unique(ft_fill_split$ft_id_1))
+### yes, two ft_id_1 are dropped
+check <- ft_fill %>%
+  filter(!ft_id_1 %in% ft_fill_split$ft_id_1)
+check %>%
+  ggplot() +
+  geom_sf()
+### the ones that get dropped are LINESTRINGs
+
+### write out
+st_write(ft_fill_split,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_nmex_updated2.shp")
+
+### clean up
+rm(nmex, ft_fill_split, ft_fill, 
+   temp_1, temp_2, temp_overlap, test_state)
+gc()
+```
+
+### split states for cyverse
+```{r}
+# AZ   CA   CO    ID   MT   NM    NV   OR   UT   WA   WY 
+# 1114 9492 1077  906  704  262   57  5736  196 1252  584 
+
+### intersect two to make dummy df
+ft_fill <- st_intersection(nv_1,
+                           nv_2)
+
+### change columns for dummy df
+ft_fill <- ft_fill %>%
+  dplyr::select(ft_id_1 = ft_id, 
+                state_1 = STATE_ABBR,
+                activity_1 = ACTIVITY,
+                date_compl_1 = DATE_COMPL,
+                fire_1 = first_fire_id,
+                fire_source_1 = first_fire_source,
+                fire_ig_1 = fire_ig_date,
+                ft_id_2 = ft_id.1,
+                state_2 = STATE_ABBR.1,
+                activity_2 = ACTIVITY.1,
+                date_compl_2 = DATE_COMPL.1,
+                fire_2 = first_fire_id.1,
+                fire_source_2 = first_fire_source.1,
+                fire_ig_2 = fire_ig_date.1,
+                geometry)
+
+### fix ft_fill
+ft_fill <- ft_fill %>%
+  st_collection_extract()
+ft_fill <- ft_fill[1, ]
+
+### write out
+st_write(ft_fill,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/cyverse/dummy_fill.shp")
+
+################################
+### make wyoming
+################################
+
+wyom <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/all_burned_fuel_treats_year_burned_polygons.shp") %>%
+  dplyr::select(.,
+                ft_id = ft_id, 
+                STATE_ABBR = STATE_A, 
+                ACTIVITY = ACTIVITY,
+                DATE_COMPL = DATE_CO, 
+                first_fire_id = frst_fr_d, 
+                first_fire_source = frst_fr_s,
+                fire_ig_date = fr_g_dt, 
+                geometry) %>%
+  filter(., STATE_ABBR == "WY")
+
+### write out
+st_write(wyom,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/cyverse/wyom_polys.shp")
+
+################################
+### make montana
+################################
+mont <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/all_burned_fuel_treats_year_burned_polygons.shp") %>%
+  dplyr::select(.,
+                ft_id = ft_id, 
+                STATE_ABBR = STATE_A, 
+                ACTIVITY = ACTIVITY,
+                DATE_COMPL = DATE_CO, 
+                first_fire_id = frst_fr_d, 
+                first_fire_source = frst_fr_s,
+                fire_ig_date = fr_g_dt, 
+                geometry) %>%
+  filter(., STATE_ABBR == "MT")
+
+### write out
+st_write(mont,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/cyverse/mont_polys.shp")
+
+################################
+### make idaho
+################################
+idah <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/all_burned_fuel_treats_year_burned_polygons.shp") %>%
+  dplyr::select(.,
+                ft_id = ft_id, 
+                STATE_ABBR = STATE_A, 
+                ACTIVITY = ACTIVITY,
+                DATE_COMPL = DATE_CO, 
+                first_fire_id = frst_fr_d, 
+                first_fire_source = frst_fr_s,
+                fire_ig_date = fr_g_dt, 
+                geometry) %>%
+  filter(., STATE_ABBR == "ID")
+
+### write out
+st_write(idah,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/cyverse/idah_polys.shp")
+
+################################
+### make colorado
+################################
+colo <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/all_burned_fuel_treats_year_burned_polygons.shp") %>%
+  dplyr::select(.,
+                ft_id = ft_id, 
+                STATE_ABBR = STATE_A, 
+                ACTIVITY = ACTIVITY,
+                DATE_COMPL = DATE_CO, 
+                first_fire_id = frst_fr_d, 
+                first_fire_source = frst_fr_s,
+                fire_ig_date = fr_g_dt, 
+                geometry) %>%
+  filter(., STATE_ABBR == "CO")
+
+### write out
+st_write(colo,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/cyverse/colo_polys.shp")
+
+################################
+### make arizona
+################################
+ariz <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/all_burned_fuel_treats_year_burned_polygons.shp") %>%
+  dplyr::select(.,
+                ft_id = ft_id, 
+                STATE_ABBR = STATE_A, 
+                ACTIVITY = ACTIVITY,
+                DATE_COMPL = DATE_CO, 
+                first_fire_id = frst_fr_d, 
+                first_fire_source = frst_fr_s,
+                fire_ig_date = fr_g_dt, 
+                geometry) %>%
+  filter(., STATE_ABBR == "AZ")
+
+### write out
+st_write(ariz,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/cyverse/ariz_polys.shp")
+
+################################
+### make washington
+################################
+wash <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/all_burned_fuel_treats_year_burned_polygons.shp") %>%
+  dplyr::select(.,
+                ft_id = ft_id, 
+                STATE_ABBR = STATE_A, 
+                ACTIVITY = ACTIVITY,
+                DATE_COMPL = DATE_CO, 
+                first_fire_id = frst_fr_d, 
+                first_fire_source = frst_fr_s,
+                fire_ig_date = fr_g_dt, 
+                geometry) %>%
+  filter(., STATE_ABBR == "WA")
+
+### write out
+st_write(wash,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/cyverse/wash_polys.shp")
+
+################################
+### make oregon
+################################
+oreg <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/all_burned_fuel_treats_year_burned_polygons.shp") %>%
+  dplyr::select(.,
+                ft_id = ft_id, 
+                STATE_ABBR = STATE_A, 
+                ACTIVITY = ACTIVITY,
+                DATE_COMPL = DATE_CO, 
+                first_fire_id = frst_fr_d, 
+                first_fire_source = frst_fr_s,
+                fire_ig_date = fr_g_dt, 
+                geometry) %>%
+  filter(., STATE_ABBR == "OR")
+
+### write out
+st_write(oreg,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/cyverse/oreg_polys.shp")
+
+################################
+### make california
+################################
+cali <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/all_burned_fuel_treats_year_burned_polygons.shp") %>%
+  dplyr::select(.,
+                ft_id = ft_id, 
+                STATE_ABBR = STATE_A, 
+                ACTIVITY = ACTIVITY,
+                DATE_COMPL = DATE_CO, 
+                first_fire_id = frst_fr_d, 
+                first_fire_source = frst_fr_s,
+                fire_ig_date = fr_g_dt, 
+                geometry) %>%
+  filter(., STATE_ABBR == "CA")
+
+### write out
+st_write(cali,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/cyverse/cali_polys.shp")
+```
+
+#### montana
+```{r, warning=FALSE}
+### open ft_fill
+ft_fill <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/cyverse/dummy_fill.shp") %>%
+  dplyr::select(.,
+                ft_id_1, 
+                state_1,
+                activity_1 = actvt_1,
+                date_compl_1 = dt_cm_1,
+                fire_1,
+                fire_source_1 = fr_sr_1,
+                fire_ig_1 = fir_g_1,
+                ft_id_2,
+                state_2,
+                activity_2 = actvt_2,
+                date_compl_2 = dt_cm_2,
+                fire_2,
+                fire_source_2 = fr_sr_2,
+                fire_ig_2 = fir_g_2,
+                geometry)
+
+### open arizona polygons
+mont <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/cyverse/mont_polys.shp") %>%
+  dplyr::select(., ft_id_1 = ft_id,
+                state_1 = STATE_A,
+                activity_1 = ACTIVIT,
+                date_compl_1 = DATE_CO,
+                fire_1 = frst_fr_d,
+                fire_source_1 = frst_fr_s,
+                fire_ig_1 = fr_g_dt,
+                geometry)
+
+### make loop for the first 100 treatments in mont
+# for (i in 1:100) {
+# for (i in 101:200) {
+# for (i in 201:300) {
+# for (i in 301:400) {
+for (i in 401:nrow(mont)) {
+  
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get polygon
+  temp_1 <- mont[i, ]
+  
+  ### filter dataset by the state of interest
+  test_state <- mont %>%
+    filter(state_1 == temp_1$state_1)
+  
+  for (j in (i+1):(nrow(test_state))) {
+    
+    ### get polygon 2
+    temp_2 <- test_state[j, ] %>%
+      dplyr::select(ft_id_2 = ft_id_1,
+                    state_2 = state_1,
+                    activity_2 = activity_1,
+                    date_compl_2 = date_compl_1,
+                    fire_2 = fire_1,
+                    fire_source_2 = fire_source_1,
+                    fire_ig_2 = fire_ig_1,
+                    geometry)
+    
+    ### intersect
+    temp_overlap <- st_intersection(temp_1,
+                                    temp_2)
+    
+    ### add to df
+    ft_fill <- rbind(ft_fill,
+                     temp_overlap)
+  }
+  
+}
+
+### remove dup row
+ft_fill <- ft_fill %>%
+  distinct()
+
+### remove nevada row
+ft_fill <- ft_fill %>%
+  filter(!state_1 == "NV")
+
+### make valid
+ft_fill <- st_make_valid(ft_fill)
+
+### fix problem shapes
+ft_fill_split <- ft_fill %>%
+  st_collection_extract()
+
+# ### are any of the objects just dropped?
+# length(unique(ft_fill$ft_id_1))
+# length(unique(ft_fill_split$ft_id_1))
+# ### yes, several ft_id_1 are dropped
+# check <- ft_fill %>%
+#   filter(!ft_id_1 %in% ft_fill_split$ft_id_1)
+# check[3, ] %>%
+#   ggplot() +
+#   geom_sf()
+# ### the ones that get dropped are LINESTRINGs, MULTILINESTRINGs
+
+# write out
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_mont_1.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_mont_2.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_mont_3.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_mont_4.shp")
+st_write(ft_fill_split,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_mont_5.shp")
+```
+
+##### combine montana
+```{r}
+### open pieces
+mt1 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_mont_1.shp")
+mt2 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_mont_2.shp")
+mt3 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_mont_3.shp")
+mt4 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_mont_4.shp")
+mt5 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_mont_5.shp")
+
+### combine
+mt_all <- rbind(mt1, mt2, mt3, mt4, mt5)
+
+### write out
+st_write(mt_all,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_mont_updated2.shp")
+
+### clean up
+rm(mt1, mt2, mt3, mt4, mt5, mt_all)
+gc()
+```
+
+#### idaho
+```{r, warning=FALSE}
+### open ft_fill
+ft_fill <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/cyverse/dummy_fill.shp") %>%
+  dplyr::select(.,
+                ft_id_1, 
+                state_1,
+                activity_1 = actvt_1,
+                date_compl_1 = dt_cm_1,
+                fire_1,
+                fire_source_1 = fr_sr_1,
+                fire_ig_1 = fir_g_1,
+                ft_id_2,
+                state_2,
+                activity_2 = actvt_2,
+                date_compl_2 = dt_cm_2,
+                fire_2,
+                fire_source_2 = fr_sr_2,
+                fire_ig_2 = fir_g_2,
+                geometry)
+
+### open idaho polygons
+idah <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/cyverse/idah_polys.shp") %>%
+  dplyr::select(., ft_id_1 = ft_id,
+                state_1 = STATE_A,
+                activity_1 = ACTIVIT,
+                date_compl_1 = DATE_CO,
+                fire_1 = frst_fr_d,
+                fire_source_1 = frst_fr_s,
+                fire_ig_1 = fr_g_dt,
+                geometry)
+
+### make loop for the first 100 treatments in mont
+# for (i in 1:100) {
+# for (i in 101:200) {
+# for (i in 201:300) {
+# for (i in 301:400) {
+# for (i in 401:500) {
+# for (i in 501:600) {
+# for (i in 601:700) {
+for (i in 701:nrow(idah)) {
+  
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get polygon
+  temp_1 <- idah[i, ]
+  
+  # ### filter dataset by the state of interest
+  # test_state <- idah %>%
+  #   filter(state_1 == temp_1$state_1)
+  
+  for (j in (i+1):(nrow(idah))) {
+    
+    ### get polygon 2
+    temp_2 <- idah[j, ] %>%
+      dplyr::select(ft_id_2 = ft_id_1,
+                    state_2 = state_1,
+                    activity_2 = activity_1,
+                    date_compl_2 = date_compl_1,
+                    fire_2 = fire_1,
+                    fire_source_2 = fire_source_1,
+                    fire_ig_2 = fire_ig_1,
+                    geometry)
+    
+    ### intersect
+    temp_overlap <- st_intersection(temp_1,
+                                    temp_2)
+    
+    ### add to df
+    ft_fill <- rbind(ft_fill,
+                     temp_overlap)
+  }
+  
+}
+
+### remove dup row
+ft_fill <- ft_fill %>%
+  distinct()
+
+### remove nevada row
+ft_fill <- ft_fill %>%
+  filter(!state_1 == "NV")
+
+### make valid
+ft_fill <- st_make_valid(ft_fill)
+
+### fix problem shapes
+ft_fill_split <- ft_fill %>%
+  st_collection_extract()
+
+# ### are any of the objects just dropped?
+# length(unique(ft_fill$ft_id_1))
+# length(unique(ft_fill_split$ft_id_1))
+# ### yes, several ft_id_1 are dropped
+# check <- ft_fill %>%
+#   filter(!ft_id_1 %in% ft_fill_split$ft_id_1)
+# check[9, ] %>%
+#   ggplot() +
+#   geom_sf()
+# ### the ones that get dropped are LINESTRINGs, MULTILINESTRINGs
+
+### write out
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_idah_1.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_idah_2.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_idah_3.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_idah_4.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_idah_5.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_idah_6.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_idah_7.shp")
+st_write(ft_fill_split,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_idah_8.shp")
+```
+
+##### combine idah
+```{r}
+### open pieces
+id1 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_idah_1.shp")
+id2 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_idah_2.shp")
+id3 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_idah_3.shp")
+id4 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_idah_4.shp")
+id5 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_idah_5.shp")
+id6 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_idah_6.shp")
+id7 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_idah_7.shp")
+id8 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_idah_8.shp")
+
+### combine
+id_all <- rbind(id1, id2, id3, id4, id5, id6, id7, id8)
+
+### write out
+st_write(id_all,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_idah_updated2.shp")
+
+### clean up
+rm(id1, id2, id3, id4, id5, id6, id7, id8, id_all)
+gc()
+```
+
+#### colorado
+```{r, warning=FALSE}
+# ### open ft_fill
+# ft_fill <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/cyverse/dummy_fill.shp") %>%
+#   dplyr::select(.,
+#                 ft_id_1, 
+#                 state_1,
+#                 activity_1 = actvt_1,
+#                 date_compl_1 = dt_cm_1,
+#                 fire_1,
+#                 fire_source_1 = fr_sr_1,
+#                 fire_ig_1 = fir_g_1,
+#                 ft_id_2,
+#                 state_2,
+#                 activity_2 = actvt_2,
+#                 date_compl_2 = dt_cm_2,
+#                 fire_2,
+#                 fire_source_2 = fr_sr_2,
+#                 fire_ig_2 = fir_g_2,
+#                 geometry)
+
+### open colorado polygons
+colo <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/cyverse/colo_polys.shp") %>%
+  dplyr::select(., ft_id_1 = ft_id,
+                state_1 = STATE_A,
+                activity_1 = ACTIVIT,
+                date_compl_1 = DATE_CO,
+                fire_1 = frst_fr_d,
+                fire_source_1 = frst_fr_s,
+                fire_ig_1 = fr_g_dt,
+                geometry)
+
+### make loop for the first 100 treatments in colo
+store_int_ft <- list()
+# for (i in 1:100) {
+# for (i in 101:200) {
+# for (i in 201:300) {
+# for (i in 301:400) {
+# for (i in 401:500) {
+# for (i in 501:600) {
+# for (i in 601:700) {
+for (i in 701:nrow(colo)) {
+  
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get polygon
+  temp_1 <- colo[i, ]
+  
+  # ### filter dataset by the state of interest
+  # test_state <- colo %>%
+  #   filter(state_1 == temp_1$state_1)
+  
+  for (j in (i+1):(nrow(colo))) {
+    
+    ### get polygon 2
+    temp_2 <- colo[j, ] %>%
+      dplyr::select(ft_id_2 = ft_id_1,
+                    state_2 = state_1,
+                    activity_2 = activity_1,
+                    date_compl_2 = date_compl_1,
+                    fire_2 = fire_1,
+                    fire_source_2 = fire_source_1,
+                    fire_ig_2 = fire_ig_1,
+                    geometry)
+    
+    ### intersect
+    temp_overlap <- st_intersection(temp_1,
+                                    temp_2)
+    
+    ### make unique output index
+    uoi <- paste(i, "_", j)
+    
+    ### try another way to output
+    store_int_ft[[uoi]] <- temp_overlap
+    
+    # ### add to df
+    # ft_fill <- rbind(ft_fill,
+    #                  temp_overlap)
+  }
+  
+}
+
+### combine sfs
+ft_fill <- do.call(rbind, store_int_ft)
+
+### remove dup row
+ft_fill <- ft_fill %>%
+  distinct()
+
+# ### remove nevada row
+# ft_fill <- ft_fill %>%
+#   filter(!state_1 == "NV")
+
+### make valid
+ft_fill <- st_make_valid(ft_fill)
+
+### fix problem shapes
+ft_fill_split <- ft_fill %>%
+  st_collection_extract()
+
+# ### are any of the objects just dropped?
+# length(unique(ft_fill$ft_id_1))
+# length(unique(ft_fill_split$ft_id_1))
+# ### yes, several ft_id_1 are dropped
+check <- ft_fill %>%
+  filter(!ft_id_1 %in% ft_fill_split$ft_id_1)
+# check[9, ] %>%
+#   ggplot() +
+#   geom_sf()
+# ### the ones that get dropped are LINESTRINGs, MULTILINESTRINGs
+
+### write out
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_colo_1.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_colo_2.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_colo_3.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_colo_4.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_colo_5.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_colo_6.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_colo_7.shp")
+st_write(ft_fill_split,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_colo_8.shp")
+```
+
+##### combine colorado
+```{r}
+### open pieces
+co1 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_colo_1.shp")
+co2 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_colo_2.shp")
+co3 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_colo_3.shp")
+co4 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_colo_4.shp")
+co5 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_colo_5.shp")
+co6 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_colo_6.shp")
+co7 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_colo_7.shp")
+co8 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_colo_8.shp")
+
+### combine
+co_all <- rbind(co1, co2, co3, co4, co5, co6, co7, co8)
+
+### write out
+st_write(co_all,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_colo_updated2.shp")
+
+### clean up
+rm(co1, co2, co3, co4, co5, co6, co7, co8, co_all)
+gc()
+```
+
+#### washington
+```{r, warning=FALSE}
+### open washington polygons
+wash <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/cyverse/wash_polys.shp") %>%
+  dplyr::select(., ft_id_1 = ft_id,
+                state_1 = STATE_A,
+                activity_1 = ACTIVIT,
+                date_compl_1 = DATE_CO,
+                fire_1 = frst_fr_d,
+                fire_source_1 = frst_fr_s,
+                fire_ig_1 = fr_g_dt,
+                geometry)
+
+### make loop for the first 100 treatments in wash
+store_int_ft <- list()
+# for (i in 1:100) {
+# for (i in 101:200) {
+# for (i in 201:300) {
+# for (i in 301:400) {
+# for (i in 401:500) {
+for (i in 501:600) {
+# for (i in 601:700) {
+# for (i in 701:nrow(wash)) {
+  
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get polygon
+  temp_1 <- wash[i, ]
+  
+  # ### filter dataset by the state of interest
+  # test_state <- wash %>%
+  #   filter(state_1 == temp_1$state_1)
+  
+  for (j in (i+1):(nrow(wash))) {
+    
+    ### get polygon 2
+    temp_2 <- wash[j, ] %>%
+      dplyr::select(ft_id_2 = ft_id_1,
+                    state_2 = state_1,
+                    activity_2 = activity_1,
+                    date_compl_2 = date_compl_1,
+                    fire_2 = fire_1,
+                    fire_source_2 = fire_source_1,
+                    fire_ig_2 = fire_ig_1,
+                    geometry)
+    
+    ### intersect
+    temp_overlap <- st_intersection(temp_1,
+                                    temp_2)
+    
+    ### make unique output index
+    uoi <- paste(i, "_", j)
+    
+    ### try another way to output
+    store_int_ft[[uoi]] <- temp_overlap
+    
+    # ### add to df
+    # ft_fill <- rbind(ft_fill,
+    #                  temp_overlap)
+  }
+  
+}
+
+### combine sfs
+ft_fill <- do.call(rbind, store_int_ft)
+
+### remove dup row
+ft_fill <- ft_fill %>%
+  distinct()
+
+# ### remove nevada row
+# ft_fill <- ft_fill %>%
+#   filter(!state_1 == "NV")
+
+### make valid
+ft_fill <- st_make_valid(ft_fill)
+
+### fix problem shapes
+ft_fill_split <- ft_fill %>%
+  st_collection_extract()
+
+# ### are any of the objects just dropped?
+# length(unique(ft_fill$ft_id_1))
+# length(unique(ft_fill_split$ft_id_1))
+# ### yes, several ft_id_1 are dropped
+check <- ft_fill %>%
+  filter(!ft_id_1 %in% ft_fill_split$ft_id_1)
+# check[9, ] %>%
+#   ggplot() +
+#   geom_sf()
+# ### the ones that get dropped are LINESTRINGs, MULTILINESTRINGs
+
+### write out
+st_write(ft_fill_split,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_wash_6.shp")
+
+### make loop for 
+store_int_ft <- list()
+for (i in 601:700) {
+
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get polygon
+  temp_1 <- wash[i, ]
+  
+  for (j in (i+1):(nrow(wash))) {
+    
+    ### get polygon 2
+    temp_2 <- wash[j, ] %>%
+      dplyr::select(ft_id_2 = ft_id_1,
+                    state_2 = state_1,
+                    activity_2 = activity_1,
+                    date_compl_2 = date_compl_1,
+                    fire_2 = fire_1,
+                    fire_source_2 = fire_source_1,
+                    fire_ig_2 = fire_ig_1,
+                    geometry)
+    
+    ### intersect
+    temp_overlap <- st_intersection(temp_1,
+                                    temp_2)
+    
+    ### make unique output index
+    uoi <- paste(i, "_", j)
+    
+    ### try another way to output
+    store_int_ft[[uoi]] <- temp_overlap
+
+  }
+  
+}
+
+### combine sfs
+ft_fill <- do.call(rbind, store_int_ft)
+
+### remove dup row
+ft_fill <- ft_fill %>%
+  distinct()
+
+# ### remove nevada row
+# ft_fill <- ft_fill %>%
+#   filter(!state_1 == "NV")
+
+### make valid
+ft_fill <- st_make_valid(ft_fill)
+
+### fix problem shapes
+ft_fill_split <- ft_fill %>%
+  st_collection_extract()
+
+### write out
+st_write(ft_fill_split,
+         "fuel_treat_overlaps_wash_7.shp")
+rm(store_int_ft, ft_fill, ft_fill_split)
+
+##########################################################
+##########################################################
+### make loop for 
+store_int_ft <- list()
+for (i in 701:800) {
+  
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get polygon
+  temp_1 <- wash[i, ]
+  
+  # ### filter dataset by the state of interest
+  # test_state <- wash %>%
+  #   filter(state_1 == temp_1$state_1)
+  
+  for (j in (i+1):(nrow(wash))) {
+    
+    ### get polygon 2
+    temp_2 <- wash[j, ] %>%
+      dplyr::select(ft_id_2 = ft_id_1,
+                    state_2 = state_1,
+                    activity_2 = activity_1,
+                    date_compl_2 = date_compl_1,
+                    fire_2 = fire_1,
+                    fire_source_2 = fire_source_1,
+                    fire_ig_2 = fire_ig_1,
+                    geometry)
+    
+    ### intersect
+    temp_overlap <- st_intersection(temp_1,
+                                    temp_2)
+    
+    ### make unique output index
+    uoi <- paste(i, "_", j)
+    
+    ### try another way to output
+    store_int_ft[[uoi]] <- temp_overlap
+    
+    # ### add to df
+    # ft_fill <- rbind(ft_fill,
+    #                  temp_overlap)
+  }
+  
+}
+
+### combine sfs
+ft_fill <- do.call(rbind, store_int_ft)
+
+### remove dup row
+ft_fill <- ft_fill %>%
+  distinct()
+
+# ### remove nevada row
+# ft_fill <- ft_fill %>%
+#   filter(!state_1 == "NV")
+
+### make valid
+ft_fill <- st_make_valid(ft_fill)
+
+### fix problem shapes
+ft_fill_split <- ft_fill %>%
+  st_collection_extract()
+
+### write out
+st_write(ft_fill_split,
+         "fuel_treat_overlaps_wash_8.shp")
+rm(store_int_ft, ft_fill, ft_fill_split)
+
+##########################################################
+##########################################################
+### make loop for 
+store_int_ft <- list()
+for (i in 801:900) {
+  
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get polygon
+  temp_1 <- wash[i, ]
+  
+  # ### filter dataset by the state of interest
+  # test_state <- wash %>%
+  #   filter(state_1 == temp_1$state_1)
+  
+  for (j in (i+1):(nrow(wash))) {
+    
+    ### get polygon 2
+    temp_2 <- wash[j, ] %>%
+      dplyr::select(ft_id_2 = ft_id_1,
+                    state_2 = state_1,
+                    activity_2 = activity_1,
+                    date_compl_2 = date_compl_1,
+                    fire_2 = fire_1,
+                    fire_source_2 = fire_source_1,
+                    fire_ig_2 = fire_ig_1,
+                    geometry)
+    
+    ### intersect
+    temp_overlap <- st_intersection(temp_1,
+                                    temp_2)
+    
+    ### make unique output index
+    uoi <- paste(i, "_", j)
+    
+    ### try another way to output
+    store_int_ft[[uoi]] <- temp_overlap
+    
+    # ### add to df
+    # ft_fill <- rbind(ft_fill,
+    #                  temp_overlap)
+  }
+  
+}
+
+### combine sfs
+ft_fill <- do.call(rbind, store_int_ft)
+
+### remove dup row
+ft_fill <- ft_fill %>%
+  distinct()
+
+# ### remove nevada row
+# ft_fill <- ft_fill %>%
+#   filter(!state_1 == "NV")
+
+### make valid
+ft_fill <- st_make_valid(ft_fill)
+
+### fix problem shapes
+ft_fill_split <- ft_fill %>%
+  st_collection_extract()
+
+### write out
+st_write(ft_fill_split,
+         "fuel_treat_overlaps_wash_9.shp")
+rm(store_int_ft, ft_fill, ft_fill_split)
+
+##########################################################
+##########################################################
+### make loop for 
+store_int_ft <- list()
+for (i in 901:1000) {
+  
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get polygon
+  temp_1 <- wash[i, ]
+  
+  # ### filter dataset by the state of interest
+  # test_state <- wash %>%
+  #   filter(state_1 == temp_1$state_1)
+  
+  for (j in (i+1):(nrow(wash))) {
+    
+    ### get polygon 2
+    temp_2 <- wash[j, ] %>%
+      dplyr::select(ft_id_2 = ft_id_1,
+                    state_2 = state_1,
+                    activity_2 = activity_1,
+                    date_compl_2 = date_compl_1,
+                    fire_2 = fire_1,
+                    fire_source_2 = fire_source_1,
+                    fire_ig_2 = fire_ig_1,
+                    geometry)
+    
+    ### intersect
+    temp_overlap <- st_intersection(temp_1,
+                                    temp_2)
+    
+    ### make unique output index
+    uoi <- paste(i, "_", j)
+    
+    ### try another way to output
+    store_int_ft[[uoi]] <- temp_overlap
+    
+    # ### add to df
+    # ft_fill <- rbind(ft_fill,
+    #                  temp_overlap)
+  }
+  
+}
+
+### combine sfs
+ft_fill <- do.call(rbind, store_int_ft)
+
+### remove dup row
+ft_fill <- ft_fill %>%
+  distinct()
+
+# ### remove nevada row
+# ft_fill <- ft_fill %>%
+#   filter(!state_1 == "NV")
+
+### make valid
+ft_fill <- st_make_valid(ft_fill)
+
+### fix problem shapes
+ft_fill_split <- ft_fill %>%
+  st_collection_extract()
+
+### write out
+st_write(ft_fill_split,
+         "fuel_treat_overlaps_wash_10.shp")
+rm(store_int_ft, ft_fill, ft_fill_split)
+
+##########################################################
+##########################################################
+### make loop for 
+store_int_ft <- list()
+for (i in 1001:nrow(wash)) {
+  
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get polygon
+  temp_1 <- wash[i, ]
+  
+  # ### filter dataset by the state of interest
+  # test_state <- wash %>%
+  #   filter(state_1 == temp_1$state_1)
+  
+  for (j in (i+1):(nrow(wash))) {
+    
+    ### get polygon 2
+    temp_2 <- wash[j, ] %>%
+      dplyr::select(ft_id_2 = ft_id_1,
+                    state_2 = state_1,
+                    activity_2 = activity_1,
+                    date_compl_2 = date_compl_1,
+                    fire_2 = fire_1,
+                    fire_source_2 = fire_source_1,
+                    fire_ig_2 = fire_ig_1,
+                    geometry)
+    
+    ### intersect
+    temp_overlap <- st_intersection(temp_1,
+                                    temp_2)
+    
+    ### make unique output index
+    uoi <- paste(i, "_", j)
+    
+    ### try another way to output
+    store_int_ft[[uoi]] <- temp_overlap
+    
+    # ### add to df
+    # ft_fill <- rbind(ft_fill,
+    #                  temp_overlap)
+  }
+  
+}
+
+### combine sfs
+ft_fill <- do.call(rbind, store_int_ft)
+
+### remove dup row
+ft_fill <- ft_fill %>%
+  distinct()
+
+# ### remove nevada row
+# ft_fill <- ft_fill %>%
+#   filter(!state_1 == "NV")
+
+### make valid
+ft_fill <- st_make_valid(ft_fill)
+
+### fix problem shapes
+ft_fill_split <- ft_fill %>%
+  st_collection_extract()
+
+### write out
+st_write(ft_fill_split,
+         "fuel_treat_overlaps_wash_11.shp")
+rm(store_int_ft, ft_fill, ft_fill_split)
+```
+
+##### combine washington
+```{r}
+### open pieces (1-11)
+wa1 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_wash_1.shp")
+wa2 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_wash_2.shp")
+wa3 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_wash_3.shp")
+wa4 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_wash_4.shp")
+wa5 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_wash_5.shp")
+wa6 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_wash_6.shp")
+wa7 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_wash_7.shp")
+wa8 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_wash_8.shp")
+wa9 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_wash_9.shp")
+wa10 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_wash_10.shp")
+wa11 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_wash_11.shp")
+
+
+### combine
+wa_all <- rbind(wa1, wa2, wa3, wa4, wa5, wa6, 
+                wa7, wa8, wa9, wa10, wa11)
+
+### write out
+st_write(wa_all,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_wash_updated2.shp")
+
+### clean up
+rm(wa1, wa2, wa3, wa4, wa5, wa6, 
+   wa7, wa8, wa9, wa10, wa11, wa_all)
+gc()
+```
+
+#### arizona
+```{r, warning=FALSE}
+### open arizona polygons
+ariz <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/cyverse/ariz_polys.shp") %>%
+  dplyr::select(., ft_id_1 = ft_id,
+                state_1 = STATE_A,
+                activity_1 = ACTIVIT,
+                date_compl_1 = DATE_CO,
+                fire_1 = frst_fr_d,
+                fire_source_1 = frst_fr_s,
+                fire_ig_1 = fr_g_dt,
+                geometry)
+
+### make loop for the first 100 treatments in ariz
+store_int_ft <- list()
+# for (i in 1:100) {
+for (i in 101:200) {
+# for (i in 201:300) {
+# for (i in 301:400) {
+# for (i in 401:500) {
+# for (i in 501:600) {
+# for (i in 601:700) {
+# for (i in 701:800) {
+# for (i in 801:900) {
+# for (i in 901:nrow(ariz)) {
+  
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get polygon
+  temp_1 <- ariz[i, ]
+  
+  # ### filter dataset by the state of interest
+  # test_state <- ariz %>%
+  #   filter(state_1 == temp_1$state_1)
+  
+  for (j in (i+1):(nrow(ariz))) {
+    
+    ### get polygon 2
+    temp_2 <- ariz[j, ] %>%
+      dplyr::select(ft_id_2 = ft_id_1,
+                    state_2 = state_1,
+                    activity_2 = activity_1,
+                    date_compl_2 = date_compl_1,
+                    fire_2 = fire_1,
+                    fire_source_2 = fire_source_1,
+                    fire_ig_2 = fire_ig_1,
+                    geometry)
+    
+    ### intersect
+    temp_overlap <- st_intersection(temp_1,
+                                    temp_2)
+    
+    ### make unique output index
+    uoi <- paste(i, "_", j)
+    
+    ### try another way to output
+    store_int_ft[[uoi]] <- temp_overlap
+    
+    # ### add to df
+    # ft_fill <- rbind(ft_fill,
+    #                  temp_overlap)
+  }
+  
+}
+
+### combine sfs
+ft_fill <- do.call(rbind, store_int_ft)
+
+### remove dup row
+ft_fill <- ft_fill %>%
+  distinct()
+
+# ### remove nevada row
+# ft_fill <- ft_fill %>%
+#   filter(!state_1 == "NV")
+
+### make valid
+ft_fill <- st_make_valid(ft_fill)
+
+### fix problem shapes
+ft_fill_split <- ft_fill %>%
+  st_collection_extract()
+
+# ### are any of the objects just dropped?
+# length(unique(ft_fill$ft_id_1))
+# length(unique(ft_fill_split$ft_id_1))
+# ### yes, several ft_id_1 are dropped
+check <- ft_fill %>%
+  filter(!ft_id_1 %in% ft_fill_split$ft_id_1)
+# check[9, ] %>%
+#   ggplot() +
+#   geom_sf()
+# ### the ones that get dropped are LINESTRINGs, MULTILINESTRINGs
+
+### write out
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_ariz_1.shp")
+st_write(ft_fill_split,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_ariz_2.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_ariz_3.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_ariz_4.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_ariz_5.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_ariz_6.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_ariz_7.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_ariz_8.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_ariz_9.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_ariz_10.shp")
+
+rm(store_int_ft)
+rm(ft_fill, ft_fill_split, check)
+```
+
+##### combine arizona
+```{r}
+### open pieces (1-11)
+az1 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_ariz_1.shp")
+az2 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_ariz_2.shp")
+az3 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_ariz_3.shp")
+az4 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_ariz_4.shp")
+az5 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_ariz_5.shp")
+az6 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_ariz_6.shp")
+az7 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_ariz_7.shp")
+az8 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_ariz_8.shp")
+az9 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_ariz_9.shp")
+az10 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_ariz_10.shp")
+
+### combine
+az_all <- rbind(az1, az2, az3, az4, az5, 
+                az6, az7, az8, az9, az10)
+
+### write out
+st_write(az_all,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_ariz_updated2.shp")
+
+### clean up
+rm(az1, az2, az3, az4, az5, az6, 
+   az7, az8, az9, az10, az_all)
+gc()
+```
+
+#### oregon
+```{r, warning=FALSE}
+### open oregon polygons
+oreg <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/cyverse/oreg_polys.shp") %>%
+  dplyr::select(., ft_id_1 = ft_id,
+                state_1 = STATE_A,
+                activity_1 = ACTIVIT,
+                date_compl_1 = DATE_CO,
+                fire_1 = frst_fr_d,
+                fire_source_1 = frst_fr_s,
+                fire_ig_1 = fr_g_dt,
+                geometry)
+
+### make loop for the first 100 treatments in oreg
+store_int_ft <- list()
+# for (i in 101:150) {
+# for (i in 151:200) {
+# for (i in 1:50) {
+for (i in 51:100) {
+# for (i in 201:300) {
+# for (i in 301:400) {
+# for (i in 401:500) {
+# for (i in 501:600) {
+# for (i in 601:700) {
+# for (i in 701:800) {
+# for (i in 801:900) {
+# for (i in 901:nrow(oreg)) {
+  
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get polygon
+  temp_1 <- oreg[i, ]
+  
+  # ### filter dataset by the state of interest
+  # test_state <- oreg %>%
+  #   filter(state_1 == temp_1$state_1)
+  
+  for (j in (i+1):(nrow(oreg))) {
+    
+    ### get polygon 2
+    temp_2 <- oreg[j, ] %>%
+      dplyr::select(ft_id_2 = ft_id_1,
+                    state_2 = state_1,
+                    activity_2 = activity_1,
+                    date_compl_2 = date_compl_1,
+                    fire_2 = fire_1,
+                    fire_source_2 = fire_source_1,
+                    fire_ig_2 = fire_ig_1,
+                    geometry)
+    
+    ### intersect
+    temp_overlap <- st_intersection(temp_1,
+                                    temp_2)
+    
+    ### make unique output index
+    uoi <- paste(i, "_", j)
+    
+    ### try another way to output
+    store_int_ft[[uoi]] <- temp_overlap
+    
+    # ### add to df
+    # ft_fill <- rbind(ft_fill,
+    #                  temp_overlap)
+  }
+  
+}
+
+### combine sfs
+ft_fill <- do.call(rbind, store_int_ft)
+
+### remove dup row
+ft_fill <- ft_fill %>%
+  distinct()
+
+# ### remove nevada row
+# ft_fill <- ft_fill %>%
+#   filter(!state_1 == "NV")
+
+### make valid
+ft_fill <- st_make_valid(ft_fill)
+
+### fix problem shapes
+ft_fill_split <- ft_fill %>%
+  st_collection_extract()
+
+# ### are any of the objects just dropped?
+# length(unique(ft_fill$ft_id_1))
+# length(unique(ft_fill_split$ft_id_1))
+# ### yes, several ft_id_1 are dropped
+check <- ft_fill %>%
+  filter(!ft_id_1 %in% ft_fill_split$ft_id_1)
+# check[9, ] %>%
+#   ggplot() +
+#   geom_sf()
+# ### the ones that get dropped are LINESTRINGs, MULTILINESTRINGs
+
+### write out
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_oreg_1.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_oreg_2.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_oreg_3.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_oreg_4.shp")
+st_write(ft_fill_split,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_oreg_5.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_oreg_6.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_oreg_7.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_oreg_8.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_oreg_9.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_oreg_10.shp")
+
+rm(store_int_ft)
+rm(ft_fill, ft_fill_split, check)
+
+### open oregon polygons
+oreg <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/cyverse/oreg_polys.shp") %>%
+  dplyr::select(., ft_id_1 = ft_id,
+                state_1 = STATE_A,
+                activity_1 = ACTIVIT,
+                date_compl_1 = DATE_CO,
+                fire_1 = frst_fr_d,
+                fire_source_1 = frst_fr_s,
+                fire_ig_1 = fr_g_dt,
+                geometry)
+
+### make loop for the first 100 treatments in oreg
+store_int_ft <- list()
+for (i in 101:150) {
+# for (i in 151:200) {
+# for (i in 201:300) {
+# for (i in 301:400) {
+# for (i in 401:500) {
+# for (i in 501:600) {
+# for (i in 601:700) {
+# for (i in 701:800) {
+# for (i in 801:900) {
+# for (i in 901:nrow(oreg)) {
+  
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get polygon
+  temp_1 <- oreg[i, ]
+  
+  # ### filter dataset by the state of interest
+  # test_state <- oreg %>%
+  #   filter(state_1 == temp_1$state_1)
+  
+  for (j in (i+1):(nrow(oreg))) {
+    
+    ### get polygon 2
+    temp_2 <- oreg[j, ] %>%
+      dplyr::select(ft_id_2 = ft_id_1,
+                    state_2 = state_1,
+                    activity_2 = activity_1,
+                    date_compl_2 = date_compl_1,
+                    fire_2 = fire_1,
+                    fire_source_2 = fire_source_1,
+                    fire_ig_2 = fire_ig_1,
+                    geometry)
+    
+    ### intersect
+    temp_overlap <- st_intersection(temp_1,
+                                    temp_2)
+    
+    ### make unique output index
+    uoi <- paste(i, "_", j)
+    
+    ### try another way to output
+    store_int_ft[[uoi]] <- temp_overlap
+    
+    # ### add to df
+    # ft_fill <- rbind(ft_fill,
+    #                  temp_overlap)
+  }
+  
+}
+
+### combine sfs
+ft_fill <- do.call(rbind, store_int_ft)
+
+### remove dup row
+ft_fill <- ft_fill %>%
+  distinct()
+
+# ### remove nevada row
+# ft_fill <- ft_fill %>%
+#   filter(!state_1 == "NV")
+
+### make valid
+ft_fill <- st_make_valid(ft_fill)
+
+### fix problem shapes
+ft_fill_split <- ft_fill %>%
+  st_collection_extract()
+
+# ### are any of the objects just dropped?
+# length(unique(ft_fill$ft_id_1))
+# length(unique(ft_fill_split$ft_id_1))
+# ### yes, several ft_id_1 are dropped
+check <- ft_fill %>%
+  filter(!ft_id_1 %in% ft_fill_split$ft_id_1)
+# check[9, ] %>%
+#   ggplot() +
+#   geom_sf()
+# ### the ones that get dropped are LINESTRINGs, MULTILINESTRINGs
+
+### write out
+st_write(ft_fill_split,
+         "fuel_treat_overlaps_oreg_6.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_oreg_7.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_oreg_8.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_oreg_9.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_oreg_10.shp")
+
+rm(store_int_ft)
+rm(ft_fill, ft_fill_split, check)
+gc()
+
+### make loop for the first 100 treatments in oreg
+store_int_ft <- list()
+# for (i in 101:150) {
+for (i in 151:200) {
+# for (i in 201:300) {
+# for (i in 301:400) {
+# for (i in 401:500) {
+# for (i in 501:600) {
+# for (i in 601:700) {
+# for (i in 701:800) {
+# for (i in 801:900) {
+# for (i in 901:nrow(oreg)) {
+  
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get polygon
+  temp_1 <- oreg[i, ]
+  
+  # ### filter dataset by the state of interest
+  # test_state <- oreg %>%
+  #   filter(state_1 == temp_1$state_1)
+  
+  for (j in (i+1):(nrow(oreg))) {
+    
+    ### get polygon 2
+    temp_2 <- oreg[j, ] %>%
+      dplyr::select(ft_id_2 = ft_id_1,
+                    state_2 = state_1,
+                    activity_2 = activity_1,
+                    date_compl_2 = date_compl_1,
+                    fire_2 = fire_1,
+                    fire_source_2 = fire_source_1,
+                    fire_ig_2 = fire_ig_1,
+                    geometry)
+    
+    ### intersect
+    temp_overlap <- st_intersection(temp_1,
+                                    temp_2)
+    
+    ### make unique output index
+    uoi <- paste(i, "_", j)
+    
+    ### try another way to output
+    store_int_ft[[uoi]] <- temp_overlap
+    
+    # ### add to df
+    # ft_fill <- rbind(ft_fill,
+    #                  temp_overlap)
+  }
+  
+}
+
+### combine sfs
+ft_fill <- do.call(rbind, store_int_ft)
+
+### remove dup row
+ft_fill <- ft_fill %>%
+  distinct()
+
+# ### remove nevada row
+# ft_fill <- ft_fill %>%
+#   filter(!state_1 == "NV")
+
+### make valid
+ft_fill <- st_make_valid(ft_fill)
+
+### fix problem shapes
+ft_fill_split <- ft_fill %>%
+  st_collection_extract()
+
+# ### are any of the objects just dropped?
+# length(unique(ft_fill$ft_id_1))
+# length(unique(ft_fill_split$ft_id_1))
+# ### yes, several ft_id_1 are dropped
+check <- ft_fill %>%
+  filter(!ft_id_1 %in% ft_fill_split$ft_id_1)
+# check[9, ] %>%
+#   ggplot() +
+#   geom_sf()
+# ### the ones that get dropped are LINESTRINGs, MULTILINESTRINGs
+
+### write out
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_oreg_6.shp")
+st_write(ft_fill_split,
+         "fuel_treat_overlaps_oreg_7.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_oreg_8.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_oreg_9.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_oreg_10.shp")
+
+rm(store_int_ft)
+rm(ft_fill, ft_fill_split, check)
+gc()
+
+### make loop for the first 100 treatments in oreg
+store_int_ft <- list()
+# for (i in 101:150) {
+# for (i in 151:200) {
+for (i in 201:250) {
+# for (i in 301:400) {
+# for (i in 401:500) {
+# for (i in 501:600) {
+# for (i in 601:700) {
+# for (i in 701:800) {
+# for (i in 801:900) {
+# for (i in 901:nrow(oreg)) {
+  
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get polygon
+  temp_1 <- oreg[i, ]
+  
+  # ### filter dataset by the state of interest
+  # test_state <- oreg %>%
+  #   filter(state_1 == temp_1$state_1)
+  
+  for (j in (i+1):(nrow(oreg))) {
+    
+    ### get polygon 2
+    temp_2 <- oreg[j, ] %>%
+      dplyr::select(ft_id_2 = ft_id_1,
+                    state_2 = state_1,
+                    activity_2 = activity_1,
+                    date_compl_2 = date_compl_1,
+                    fire_2 = fire_1,
+                    fire_source_2 = fire_source_1,
+                    fire_ig_2 = fire_ig_1,
+                    geometry)
+    
+    ### intersect
+    temp_overlap <- st_intersection(temp_1,
+                                    temp_2)
+    
+    ### make unique output index
+    uoi <- paste(i, "_", j)
+    
+    ### try another way to output
+    store_int_ft[[uoi]] <- temp_overlap
+    
+    # ### add to df
+    # ft_fill <- rbind(ft_fill,
+    #                  temp_overlap)
+  }
+  
+}
+
+### combine sfs
+ft_fill <- do.call(rbind, store_int_ft)
+
+### remove dup row
+ft_fill <- ft_fill %>%
+  distinct()
+
+# ### remove nevada row
+# ft_fill <- ft_fill %>%
+#   filter(!state_1 == "NV")
+
+### make valid
+ft_fill <- st_make_valid(ft_fill)
+
+### fix problem shapes
+ft_fill_split <- ft_fill %>%
+  st_collection_extract()
+
+# ### are any of the objects just dropped?
+# length(unique(ft_fill$ft_id_1))
+# length(unique(ft_fill_split$ft_id_1))
+# ### yes, several ft_id_1 are dropped
+check <- ft_fill %>%
+  filter(!ft_id_1 %in% ft_fill_split$ft_id_1)
+# check[9, ] %>%
+#   ggplot() +
+#   geom_sf()
+# ### the ones that get dropped are LINESTRINGs, MULTILINESTRINGs
+
+### write out
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_oreg_6.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_oreg_7.shp")
+st_write(ft_fill_split,
+         "fuel_treat_overlaps_oreg_8.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_oreg_9.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_oreg_10.shp")
+
+rm(store_int_ft)
+rm(ft_fill, ft_fill_split, check)
+gc()
+
+### make loop for the first 100 treatments in oreg
+store_int_ft <- list()
+# for (i in 101:150) {
+# for (i in 151:200) {
+# for (i in 201:250) {
+for (i in 251:300) {
+# for (i in 301:400) {
+# for (i in 401:500) {
+# for (i in 501:600) {
+# for (i in 601:700) {
+# for (i in 701:800) {
+# for (i in 801:900) {
+# for (i in 901:nrow(oreg)) {
+  
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get polygon
+  temp_1 <- oreg[i, ]
+  
+  # ### filter dataset by the state of interest
+  # test_state <- oreg %>%
+  #   filter(state_1 == temp_1$state_1)
+  
+  for (j in (i+1):(nrow(oreg))) {
+    
+    ### get polygon 2
+    temp_2 <- oreg[j, ] %>%
+      dplyr::select(ft_id_2 = ft_id_1,
+                    state_2 = state_1,
+                    activity_2 = activity_1,
+                    date_compl_2 = date_compl_1,
+                    fire_2 = fire_1,
+                    fire_source_2 = fire_source_1,
+                    fire_ig_2 = fire_ig_1,
+                    geometry)
+    
+    ### intersect
+    temp_overlap <- st_intersection(temp_1,
+                                    temp_2)
+    
+    ### make unique output index
+    uoi <- paste(i, "_", j)
+    
+    ### try another way to output
+    store_int_ft[[uoi]] <- temp_overlap
+    
+    # ### add to df
+    # ft_fill <- rbind(ft_fill,
+    #                  temp_overlap)
+  }
+  
+}
+
+### combine sfs
+ft_fill <- do.call(rbind, store_int_ft)
+
+### remove dup row
+ft_fill <- ft_fill %>%
+  distinct()
+
+# ### remove nevada row
+# ft_fill <- ft_fill %>%
+#   filter(!state_1 == "NV")
+
+### make valid
+ft_fill <- st_make_valid(ft_fill)
+
+### fix problem shapes
+ft_fill_split <- ft_fill %>%
+  st_collection_extract()
+
+# ### are any of the objects just dropped?
+# length(unique(ft_fill$ft_id_1))
+# length(unique(ft_fill_split$ft_id_1))
+# ### yes, several ft_id_1 are dropped
+check <- ft_fill %>%
+  filter(!ft_id_1 %in% ft_fill_split$ft_id_1)
+# check[9, ] %>%
+#   ggplot() +
+#   geom_sf()
+# ### the ones that get dropped are LINESTRINGs, MULTILINESTRINGs
+
+### write out
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_oreg_6.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_oreg_7.shp")
+# st_write(ft_fill_split,
+#          "fuel_treat_overlaps_oreg_8.shp")
+st_write(ft_fill_split,
+         "fuel_treat_overlaps_oreg_9.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_oreg_10.shp")
+
+rm(store_int_ft)
+rm(ft_fill, ft_fill_split, check)
+gc()
+
+### make loop for the first 100 treatments in oreg
+store_int_ft <- list()
+# for (i in 101:150) {
+# for (i in 151:200) {
+# for (i in 201:250) {
+# for (i in 251:300) {
+for (i in 301:350) {
+# for (i in 401:500) {
+# for (i in 501:600) {
+# for (i in 601:700) {
+# for (i in 701:800) {
+# for (i in 801:900) {
+# for (i in 901:nrow(oreg)) {
+  
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get polygon
+  temp_1 <- oreg[i, ]
+  
+  # ### filter dataset by the state of interest
+  # test_state <- oreg %>%
+  #   filter(state_1 == temp_1$state_1)
+  
+  for (j in (i+1):(nrow(oreg))) {
+    
+    ### get polygon 2
+    temp_2 <- oreg[j, ] %>%
+      dplyr::select(ft_id_2 = ft_id_1,
+                    state_2 = state_1,
+                    activity_2 = activity_1,
+                    date_compl_2 = date_compl_1,
+                    fire_2 = fire_1,
+                    fire_source_2 = fire_source_1,
+                    fire_ig_2 = fire_ig_1,
+                    geometry)
+    
+    ### intersect
+    temp_overlap <- st_intersection(temp_1,
+                                    temp_2)
+    
+    ### make unique output index
+    uoi <- paste(i, "_", j)
+    
+    ### try another way to output
+    store_int_ft[[uoi]] <- temp_overlap
+    
+    # ### add to df
+    # ft_fill <- rbind(ft_fill,
+    #                  temp_overlap)
+  }
+  
+}
+
+### combine sfs
+ft_fill <- do.call(rbind, store_int_ft)
+
+### remove dup row
+ft_fill <- ft_fill %>%
+  distinct()
+
+# ### remove nevada row
+# ft_fill <- ft_fill %>%
+#   filter(!state_1 == "NV")
+
+### make valid
+ft_fill <- st_make_valid(ft_fill)
+
+### fix problem shapes
+ft_fill_split <- ft_fill %>%
+  st_collection_extract()
+
+# ### are any of the objects just dropped?
+# length(unique(ft_fill$ft_id_1))
+# length(unique(ft_fill_split$ft_id_1))
+# ### yes, several ft_id_1 are dropped
+check <- ft_fill %>%
+  filter(!ft_id_1 %in% ft_fill_split$ft_id_1)
+# check[9, ] %>%
+#   ggplot() +
+#   geom_sf()
+# ### the ones that get dropped are LINESTRINGs, MULTILINESTRINGs
+
+### write out
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_oreg_6.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_oreg_7.shp")
+# st_write(ft_fill_split,
+#          "fuel_treat_overlaps_oreg_8.shp")
+# st_write(ft_fill_split,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_oreg_9.shp")
+st_write(ft_fill_split,
+         "fuel_treat_overlaps_oreg_10.shp")
+
+rm(store_int_ft)
+rm(ft_fill, ft_fill_split, check)
+gc()
+
+### make loop for the first 100 treatments in oreg
+store_int_ft <- list()
+# for (i in 101:150) {
+# for (i in 151:200) {
+# for (i in 201:250) {
+# for (i in 251:300) {
+# for (i in 301:350) {
+for (i in 351:400) {
+# for (i in 401:500) {
+# for (i in 501:600) {
+# for (i in 601:700) {
+# for (i in 701:800) {
+# for (i in 801:900) {
+# for (i in 901:nrow(oreg)) {
+  
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get polygon
+  temp_1 <- oreg[i, ]
+  
+  # ### filter dataset by the state of interest
+  # test_state <- oreg %>%
+  #   filter(state_1 == temp_1$state_1)
+  
+  for (j in (i+1):(nrow(oreg))) {
+    
+    ### get polygon 2
+    temp_2 <- oreg[j, ] %>%
+      dplyr::select(ft_id_2 = ft_id_1,
+                    state_2 = state_1,
+                    activity_2 = activity_1,
+                    date_compl_2 = date_compl_1,
+                    fire_2 = fire_1,
+                    fire_source_2 = fire_source_1,
+                    fire_ig_2 = fire_ig_1,
+                    geometry)
+    
+    ### intersect
+    temp_overlap <- st_intersection(temp_1,
+                                    temp_2)
+    
+    ### make unique output index
+    uoi <- paste(i, "_", j)
+    
+    ### try another way to output
+    store_int_ft[[uoi]] <- temp_overlap
+    
+    # ### add to df
+    # ft_fill <- rbind(ft_fill,
+    #                  temp_overlap)
+  }
+  
+}
+
+### combine sfs
+ft_fill <- do.call(rbind, store_int_ft)
+
+### remove dup row
+ft_fill <- ft_fill %>%
+  distinct()
+
+# ### remove nevada row
+# ft_fill <- ft_fill %>%
+#   filter(!state_1 == "NV")
+
+### make valid
+ft_fill <- st_make_valid(ft_fill)
+
+### fix problem shapes
+ft_fill_split <- ft_fill %>%
+  st_collection_extract()
+
+# ### are any of the objects just dropped?
+# length(unique(ft_fill$ft_id_1))
+# length(unique(ft_fill_split$ft_id_1))
+# ### yes, several ft_id_1 are dropped
+check <- ft_fill %>%
+  filter(!ft_id_1 %in% ft_fill_split$ft_id_1)
+# check[9, ] %>%
+#   ggplot() +
+#   geom_sf()
+# ### the ones that get dropped are LINESTRINGs, MULTILINESTRINGs
+
+### write out
+st_write(ft_fill_split,
+         "fuel_treat_overlaps_oreg_11.shp")
+
+rm(store_int_ft)
+rm(ft_fill, ft_fill_split, check)
+gc()
+
+### make loop for the first 100 treatments in oreg
+store_int_ft <- list()
+# for (i in 101:150) {
+# for (i in 151:200) {
+# for (i in 201:250) {
+# for (i in 251:300) {
+# for (i in 301:350) {
+# for (i in 351:400) {
+for (i in 401:450) {
+# for (i in 501:600) {
+# for (i in 601:700) {
+# for (i in 701:800) {
+# for (i in 801:900) {
+# for (i in 901:nrow(oreg)) {
+  
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get polygon
+  temp_1 <- oreg[i, ]
+  
+  # ### filter dataset by the state of interest
+  # test_state <- oreg %>%
+  #   filter(state_1 == temp_1$state_1)
+  
+  for (j in (i+1):(nrow(oreg))) {
+    
+    ### get polygon 2
+    temp_2 <- oreg[j, ] %>%
+      dplyr::select(ft_id_2 = ft_id_1,
+                    state_2 = state_1,
+                    activity_2 = activity_1,
+                    date_compl_2 = date_compl_1,
+                    fire_2 = fire_1,
+                    fire_source_2 = fire_source_1,
+                    fire_ig_2 = fire_ig_1,
+                    geometry)
+    
+    ### intersect
+    temp_overlap <- st_intersection(temp_1,
+                                    temp_2)
+    
+    ### make unique output index
+    uoi <- paste(i, "_", j)
+    
+    ### try another way to output
+    store_int_ft[[uoi]] <- temp_overlap
+    
+    # ### add to df
+    # ft_fill <- rbind(ft_fill,
+    #                  temp_overlap)
+  }
+  
+}
+
+### combine sfs
+ft_fill <- do.call(rbind, store_int_ft)
+
+### remove dup row
+ft_fill <- ft_fill %>%
+  distinct()
+
+# ### remove nevada row
+# ft_fill <- ft_fill %>%
+#   filter(!state_1 == "NV")
+
+### make valid
+ft_fill <- st_make_valid(ft_fill)
+
+### fix problem shapes
+ft_fill_split <- ft_fill %>%
+  st_collection_extract()
+
+# ### are any of the objects just dropped?
+# length(unique(ft_fill$ft_id_1))
+# length(unique(ft_fill_split$ft_id_1))
+# ### yes, several ft_id_1 are dropped
+check <- ft_fill %>%
+  filter(!ft_id_1 %in% ft_fill_split$ft_id_1)
+# check[9, ] %>%
+#   ggplot() +
+#   geom_sf()
+# ### the ones that get dropped are LINESTRINGs, MULTILINESTRINGs
+
+### write out
+st_write(ft_fill_split,
+         "fuel_treat_overlaps_oreg_12.shp")
+
+rm(store_int_ft)
+rm(ft_fill, ft_fill_split, check)
+gc()
+
+### make loop for the first 100 treatments in oreg
+store_int_ft <- list()
+
+for (i in 451:500) {
+# for (i in 901:nrow(oreg)) {
+  
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get polygon
+  temp_1 <- oreg[i, ]
+
+  for (j in (i+1):(nrow(oreg))) {
+    
+    ### get polygon 2
+    temp_2 <- oreg[j, ] %>%
+      dplyr::select(ft_id_2 = ft_id_1,
+                    state_2 = state_1,
+                    activity_2 = activity_1,
+                    date_compl_2 = date_compl_1,
+                    fire_2 = fire_1,
+                    fire_source_2 = fire_source_1,
+                    fire_ig_2 = fire_ig_1,
+                    geometry)
+    
+    ### intersect
+    temp_overlap <- st_intersection(temp_1,
+                                    temp_2)
+    
+    ### make unique output index
+    uoi <- paste(i, "_", j)
+    
+    ### try another way to output
+    store_int_ft[[uoi]] <- temp_overlap
+    
+  }
+  
+}
+
+### combine sfs
+ft_fill <- do.call(rbind, store_int_ft)
+
+### remove dup row
+ft_fill <- ft_fill %>%
+  distinct()
+
+# ### remove nevada row
+# ft_fill <- ft_fill %>%
+#   filter(!state_1 == "NV")
+
+### make valid
+ft_fill <- st_make_valid(ft_fill)
+
+### fix problem shapes
+ft_fill_split <- ft_fill %>%
+  st_collection_extract()
+
+# ### are any of the objects just dropped?
+# length(unique(ft_fill$ft_id_1))
+# length(unique(ft_fill_split$ft_id_1))
+# ### yes, several ft_id_1 are dropped
+check <- ft_fill %>%
+  filter(!ft_id_1 %in% ft_fill_split$ft_id_1)
+# check[9, ] %>%
+#   ggplot() +
+#   geom_sf()
+# ### the ones that get dropped are LINESTRINGs, MULTILINESTRINGs
+
+### write out
+st_write(ft_fill_split,
+         "fuel_treat_overlaps_oreg_13.shp")
+
+rm(store_int_ft)
+rm(ft_fill, ft_fill_split, check)
+gc()
+
+### make loop for the first 100 treatments in oreg
+store_int_ft <- list()
+
+for (i in 501:550) {
+# for (i in 901:nrow(oreg)) {
+  
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get polygon
+  temp_1 <- oreg[i, ]
+
+  for (j in (i+1):(nrow(oreg))) {
+    
+    ### get polygon 2
+    temp_2 <- oreg[j, ] %>%
+      dplyr::select(ft_id_2 = ft_id_1,
+                    state_2 = state_1,
+                    activity_2 = activity_1,
+                    date_compl_2 = date_compl_1,
+                    fire_2 = fire_1,
+                    fire_source_2 = fire_source_1,
+                    fire_ig_2 = fire_ig_1,
+                    geometry)
+    
+    ### intersect
+    temp_overlap <- st_intersection(temp_1,
+                                    temp_2)
+    
+    ### make unique output index
+    uoi <- paste(i, "_", j)
+    
+    ### try another way to output
+    store_int_ft[[uoi]] <- temp_overlap
+    
+  }
+  
+}
+
+### combine sfs
+ft_fill <- do.call(rbind, store_int_ft)
+
+### remove dup row
+ft_fill <- ft_fill %>%
+  distinct()
+
+# ### remove nevada row
+# ft_fill <- ft_fill %>%
+#   filter(!state_1 == "NV")
+
+### make valid
+ft_fill <- st_make_valid(ft_fill)
+
+### fix problem shapes
+ft_fill_split <- ft_fill %>%
+  st_collection_extract()
+
+# ### are any of the objects just dropped?
+# length(unique(ft_fill$ft_id_1))
+# length(unique(ft_fill_split$ft_id_1))
+# ### yes, several ft_id_1 are dropped
+check <- ft_fill %>%
+  filter(!ft_id_1 %in% ft_fill_split$ft_id_1)
+# check[9, ] %>%
+#   ggplot() +
+#   geom_sf()
+# ### the ones that get dropped are LINESTRINGs, MULTILINESTRINGs
+
+### write out
+st_write(ft_fill_split,
+         "fuel_treat_overlaps_oreg_14.shp")
+
+rm(store_int_ft)
+rm(ft_fill, ft_fill_split, check)
+gc()
+
+### make loop for the first 100 treatments in oreg
+store_int_ft <- list()
+
+for (i in 551:600) {
+# for (i in 901:nrow(oreg)) {
+  
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get polygon
+  temp_1 <- oreg[i, ]
+
+  for (j in (i+1):(nrow(oreg))) {
+    
+    ### get polygon 2
+    temp_2 <- oreg[j, ] %>%
+      dplyr::select(ft_id_2 = ft_id_1,
+                    state_2 = state_1,
+                    activity_2 = activity_1,
+                    date_compl_2 = date_compl_1,
+                    fire_2 = fire_1,
+                    fire_source_2 = fire_source_1,
+                    fire_ig_2 = fire_ig_1,
+                    geometry)
+    
+    ### intersect
+    temp_overlap <- st_intersection(temp_1,
+                                    temp_2)
+    
+    ### make unique output index
+    uoi <- paste(i, "_", j)
+    
+    ### try another way to output
+    store_int_ft[[uoi]] <- temp_overlap
+    
+  }
+  
+}
+
+### combine sfs
+ft_fill <- do.call(rbind, store_int_ft)
+
+### remove dup row
+ft_fill <- ft_fill %>%
+  distinct()
+
+# ### remove nevada row
+# ft_fill <- ft_fill %>%
+#   filter(!state_1 == "NV")
+
+### make valid
+ft_fill <- st_make_valid(ft_fill)
+
+### fix problem shapes
+ft_fill_split <- ft_fill %>%
+  st_collection_extract()
+
+# ### are any of the objects just dropped?
+# length(unique(ft_fill$ft_id_1))
+# length(unique(ft_fill_split$ft_id_1))
+# ### yes, several ft_id_1 are dropped
+check <- ft_fill %>%
+  filter(!ft_id_1 %in% ft_fill_split$ft_id_1)
+# check[9, ] %>%
+#   ggplot() +
+#   geom_sf()
+# ### the ones that get dropped are LINESTRINGs, MULTILINESTRINGs
+
+### write out
+st_write(ft_fill_split,
+         "fuel_treat_overlaps_oreg_15.shp")
+
+rm(store_int_ft)
+rm(ft_fill, ft_fill_split, check)
+gc()
+
+### make loop for the first 100 treatments in oreg
+store_int_ft <- list()
+
+for (i in 601:650) {
+# for (i in 901:nrow(oreg)) {
+  
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get polygon
+  temp_1 <- oreg[i, ]
+
+  for (j in (i+1):(nrow(oreg))) {
+    
+    ### get polygon 2
+    temp_2 <- oreg[j, ] %>%
+      dplyr::select(ft_id_2 = ft_id_1,
+                    state_2 = state_1,
+                    activity_2 = activity_1,
+                    date_compl_2 = date_compl_1,
+                    fire_2 = fire_1,
+                    fire_source_2 = fire_source_1,
+                    fire_ig_2 = fire_ig_1,
+                    geometry)
+    
+    ### intersect
+    temp_overlap <- st_intersection(temp_1,
+                                    temp_2)
+    
+    ### make unique output index
+    uoi <- paste(i, "_", j)
+    
+    ### try another way to output
+    store_int_ft[[uoi]] <- temp_overlap
+    
+  }
+  
+}
+
+### combine sfs
+ft_fill <- do.call(rbind, store_int_ft)
+
+### remove dup row
+ft_fill <- ft_fill %>%
+  distinct()
+
+# ### remove nevada row
+# ft_fill <- ft_fill %>%
+#   filter(!state_1 == "NV")
+
+### make valid
+ft_fill <- st_make_valid(ft_fill)
+
+### fix problem shapes
+ft_fill_split <- ft_fill %>%
+  st_collection_extract()
+
+# ### are any of the objects just dropped?
+# length(unique(ft_fill$ft_id_1))
+# length(unique(ft_fill_split$ft_id_1))
+# ### yes, several ft_id_1 are dropped
+check <- ft_fill %>%
+  filter(!ft_id_1 %in% ft_fill_split$ft_id_1)
+# check[9, ] %>%
+#   ggplot() +
+#   geom_sf()
+# ### the ones that get dropped are LINESTRINGs, MULTILINESTRINGs
+
+### write out
+st_write(ft_fill_split,
+         "fuel_treat_overlaps_oreg_16.shp")
+
+rm(store_int_ft)
+rm(ft_fill, ft_fill_split, check)
+gc()
+
+### make loop for the first 100 treatments in oreg
+store_int_ft <- list()
+
+for (i in 651:700) {
+# for (i in 901:nrow(oreg)) {
+  
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get polygon
+  temp_1 <- oreg[i, ]
+
+  for (j in (i+1):(nrow(oreg))) {
+    
+    ### get polygon 2
+    temp_2 <- oreg[j, ] %>%
+      dplyr::select(ft_id_2 = ft_id_1,
+                    state_2 = state_1,
+                    activity_2 = activity_1,
+                    date_compl_2 = date_compl_1,
+                    fire_2 = fire_1,
+                    fire_source_2 = fire_source_1,
+                    fire_ig_2 = fire_ig_1,
+                    geometry)
+    
+    ### intersect
+    temp_overlap <- st_intersection(temp_1,
+                                    temp_2)
+    
+    ### make unique output index
+    uoi <- paste(i, "_", j)
+    
+    ### try another way to output
+    store_int_ft[[uoi]] <- temp_overlap
+    
+  }
+  
+}
+
+### combine sfs
+ft_fill <- do.call(rbind, store_int_ft)
+
+### remove dup row
+ft_fill <- ft_fill %>%
+  distinct()
+
+# ### remove nevada row
+# ft_fill <- ft_fill %>%
+#   filter(!state_1 == "NV")
+
+### make valid
+ft_fill <- st_make_valid(ft_fill)
+
+### fix problem shapes
+ft_fill_split <- ft_fill %>%
+  st_collection_extract()
+
+# ### are any of the objects just dropped?
+# length(unique(ft_fill$ft_id_1))
+# length(unique(ft_fill_split$ft_id_1))
+# ### yes, several ft_id_1 are dropped
+check <- ft_fill %>%
+  filter(!ft_id_1 %in% ft_fill_split$ft_id_1)
+# check[9, ] %>%
+#   ggplot() +
+#   geom_sf()
+# ### the ones that get dropped are LINESTRINGs, MULTILINESTRINGs
+
+### write out
+st_write(ft_fill_split,
+         "fuel_treat_overlaps_oreg_17.shp")
+
+rm(store_int_ft)
+rm(ft_fill, ft_fill_split, check)
+gc()
+
+### make loop for the first 100 treatments in oreg
+store_int_ft <- list()
+
+for (i in 701:750) {
+# for (i in 901:nrow(oreg)) {
+  
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get polygon
+  temp_1 <- oreg[i, ]
+
+  for (j in (i+1):(nrow(oreg))) {
+    
+    ### get polygon 2
+    temp_2 <- oreg[j, ] %>%
+      dplyr::select(ft_id_2 = ft_id_1,
+                    state_2 = state_1,
+                    activity_2 = activity_1,
+                    date_compl_2 = date_compl_1,
+                    fire_2 = fire_1,
+                    fire_source_2 = fire_source_1,
+                    fire_ig_2 = fire_ig_1,
+                    geometry)
+    
+    ### intersect
+    temp_overlap <- st_intersection(temp_1,
+                                    temp_2)
+    
+    ### make unique output index
+    uoi <- paste(i, "_", j)
+    
+    ### try another way to output
+    store_int_ft[[uoi]] <- temp_overlap
+    
+  }
+  
+}
+
+### combine sfs
+ft_fill <- do.call(rbind, store_int_ft)
+
+### remove dup row
+ft_fill <- ft_fill %>%
+  distinct()
+
+# ### remove nevada row
+# ft_fill <- ft_fill %>%
+#   filter(!state_1 == "NV")
+
+### make valid
+ft_fill <- st_make_valid(ft_fill)
+
+### fix problem shapes
+ft_fill_split <- ft_fill %>%
+  st_collection_extract()
+
+# ### are any of the objects just dropped?
+# length(unique(ft_fill$ft_id_1))
+# length(unique(ft_fill_split$ft_id_1))
+# ### yes, several ft_id_1 are dropped
+check <- ft_fill %>%
+  filter(!ft_id_1 %in% ft_fill_split$ft_id_1)
+# check[9, ] %>%
+#   ggplot() +
+#   geom_sf()
+# ### the ones that get dropped are LINESTRINGs, MULTILINESTRINGs
+
+### write out
+st_write(ft_fill_split,
+         "fuel_treat_overlaps_oreg_18.shp")
+
+rm(store_int_ft)
+rm(ft_fill, ft_fill_split, check)
+gc()
+
+### make loop for the first 100 treatments in oreg
+store_int_ft <- list()
+
+for (i in 751:800) {
+# for (i in 901:nrow(oreg)) {
+  
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get polygon
+  temp_1 <- oreg[i, ]
+
+  for (j in (i+1):(nrow(oreg))) {
+    
+    ### get polygon 2
+    temp_2 <- oreg[j, ] %>%
+      dplyr::select(ft_id_2 = ft_id_1,
+                    state_2 = state_1,
+                    activity_2 = activity_1,
+                    date_compl_2 = date_compl_1,
+                    fire_2 = fire_1,
+                    fire_source_2 = fire_source_1,
+                    fire_ig_2 = fire_ig_1,
+                    geometry)
+    
+    ### intersect
+    temp_overlap <- st_intersection(temp_1,
+                                    temp_2)
+    
+    ### make unique output index
+    uoi <- paste(i, "_", j)
+    
+    ### try another way to output
+    store_int_ft[[uoi]] <- temp_overlap
+    
+  }
+  
+}
+
+### combine sfs
+ft_fill <- do.call(rbind, store_int_ft)
+
+### remove dup row
+ft_fill <- ft_fill %>%
+  distinct()
+
+# ### remove nevada row
+# ft_fill <- ft_fill %>%
+#   filter(!state_1 == "NV")
+
+### make valid
+ft_fill <- st_make_valid(ft_fill)
+
+### fix problem shapes
+ft_fill_split <- ft_fill %>%
+  st_collection_extract()
+
+# ### are any of the objects just dropped?
+# length(unique(ft_fill$ft_id_1))
+# length(unique(ft_fill_split$ft_id_1))
+# ### yes, several ft_id_1 are dropped
+check <- ft_fill %>%
+  filter(!ft_id_1 %in% ft_fill_split$ft_id_1)
+# check[9, ] %>%
+#   ggplot() +
+#   geom_sf()
+# ### the ones that get dropped are LINESTRINGs, MULTILINESTRINGs
+
+### write out
+st_write(ft_fill_split,
+         "fuel_treat_overlaps_oreg_19.shp")
+
+rm(store_int_ft)
+rm(ft_fill, ft_fill_split, check)
+gc()
+
+### make loop for the first 100 treatments in oreg
+store_int_ft <- list()
+
+for (i in 801:850) {
+# for (i in 901:nrow(oreg)) {
+  
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get polygon
+  temp_1 <- oreg[i, ]
+
+  for (j in (i+1):(nrow(oreg))) {
+    
+    ### get polygon 2
+    temp_2 <- oreg[j, ] %>%
+      dplyr::select(ft_id_2 = ft_id_1,
+                    state_2 = state_1,
+                    activity_2 = activity_1,
+                    date_compl_2 = date_compl_1,
+                    fire_2 = fire_1,
+                    fire_source_2 = fire_source_1,
+                    fire_ig_2 = fire_ig_1,
+                    geometry)
+    
+    ### intersect
+    temp_overlap <- st_intersection(temp_1,
+                                    temp_2)
+    
+    ### make unique output index
+    uoi <- paste(i, "_", j)
+    
+    ### try another way to output
+    store_int_ft[[uoi]] <- temp_overlap
+    
+  }
+  
+}
+
+### combine sfs
+ft_fill <- do.call(rbind, store_int_ft)
+
+### remove dup row
+ft_fill <- ft_fill %>%
+  distinct()
+
+# ### remove nevada row
+# ft_fill <- ft_fill %>%
+#   filter(!state_1 == "NV")
+
+### make valid
+ft_fill <- st_make_valid(ft_fill)
+
+### fix problem shapes
+ft_fill_split <- ft_fill %>%
+  st_collection_extract()
+
+# ### are any of the objects just dropped?
+# length(unique(ft_fill$ft_id_1))
+# length(unique(ft_fill_split$ft_id_1))
+# ### yes, several ft_id_1 are dropped
+check <- ft_fill %>%
+  filter(!ft_id_1 %in% ft_fill_split$ft_id_1)
+# check[9, ] %>%
+#   ggplot() +
+#   geom_sf()
+# ### the ones that get dropped are LINESTRINGs, MULTILINESTRINGs
+
+### write out
+st_write(ft_fill_split,
+         "fuel_treat_overlaps_oreg_850.shp")
+
+rm(store_int_ft)
+rm(ft_fill, ft_fill_split, check)
+gc()
+
+### make loop for the first 100 treatments in oreg
+store_int_ft <- list()
+
+for (i in 851:900) {
+# for (i in 901:nrow(oreg)) {
+  
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get polygon
+  temp_1 <- oreg[i, ]
+
+  for (j in (i+1):(nrow(oreg))) {
+    
+    ### get polygon 2
+    temp_2 <- oreg[j, ] %>%
+      dplyr::select(ft_id_2 = ft_id_1,
+                    state_2 = state_1,
+                    activity_2 = activity_1,
+                    date_compl_2 = date_compl_1,
+                    fire_2 = fire_1,
+                    fire_source_2 = fire_source_1,
+                    fire_ig_2 = fire_ig_1,
+                    geometry)
+    
+    ### intersect
+    temp_overlap <- st_intersection(temp_1,
+                                    temp_2)
+    
+    ### make unique output index
+    uoi <- paste(i, "_", j)
+    
+    ### try another way to output
+    store_int_ft[[uoi]] <- temp_overlap
+    
+  }
+  
+}
+
+### combine sfs
+ft_fill <- do.call(rbind, store_int_ft)
+
+### remove dup row
+ft_fill <- ft_fill %>%
+  distinct()
+
+# ### remove nevada row
+# ft_fill <- ft_fill %>%
+#   filter(!state_1 == "NV")
+
+### make valid
+ft_fill <- st_make_valid(ft_fill)
+
+### fix problem shapes
+ft_fill_split <- ft_fill %>%
+  st_collection_extract()
+
+# ### are any of the objects just dropped?
+# length(unique(ft_fill$ft_id_1))
+# length(unique(ft_fill_split$ft_id_1))
+# ### yes, several ft_id_1 are dropped
+check <- ft_fill %>%
+  filter(!ft_id_1 %in% ft_fill_split$ft_id_1)
+# check[9, ] %>%
+#   ggplot() +
+#   geom_sf()
+# ### the ones that get dropped are LINESTRINGs, MULTILINESTRINGs
+
+### write out
+st_write(ft_fill_split,
+         "fuel_treat_overlaps_oreg_900.shp")
+
+rm(store_int_ft)
+rm(ft_fill, ft_fill_split, check)
+gc()
+
+### make loop for the first 100 treatments in oreg
+store_int_ft <- list()
+
+for (i in 951:1000) {
+# for (i in 901:nrow(oreg)) {
+  
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get polygon
+  temp_1 <- oreg[i, ]
+
+  for (j in (i+1):(nrow(oreg))) {
+    
+    ### get polygon 2
+    temp_2 <- oreg[j, ] %>%
+      dplyr::select(ft_id_2 = ft_id_1,
+                    state_2 = state_1,
+                    activity_2 = activity_1,
+                    date_compl_2 = date_compl_1,
+                    fire_2 = fire_1,
+                    fire_source_2 = fire_source_1,
+                    fire_ig_2 = fire_ig_1,
+                    geometry)
+    
+    ### intersect
+    temp_overlap <- st_intersection(temp_1,
+                                    temp_2)
+    
+    ### make unique output index
+    uoi <- paste(i, "_", j)
+    
+    ### try another way to output
+    store_int_ft[[uoi]] <- temp_overlap
+    
+  }
+  
+}
+
+### combine sfs
+ft_fill <- do.call(rbind, store_int_ft)
+
+### remove dup row
+ft_fill <- ft_fill %>%
+  distinct()
+
+# ### remove nevada row
+# ft_fill <- ft_fill %>%
+#   filter(!state_1 == "NV")
+
+### make valid
+ft_fill <- st_make_valid(ft_fill)
+
+### fix problem shapes
+ft_fill_split <- ft_fill %>%
+  st_collection_extract()
+
+# ### are any of the objects just dropped?
+# length(unique(ft_fill$ft_id_1))
+# length(unique(ft_fill_split$ft_id_1))
+# ### yes, several ft_id_1 are dropped
+check <- ft_fill %>%
+  filter(!ft_id_1 %in% ft_fill_split$ft_id_1)
+# check[9, ] %>%
+#   ggplot() +
+#   geom_sf()
+# ### the ones that get dropped are LINESTRINGs, MULTILINESTRINGs
+
+### write out
+st_write(ft_fill_split,
+         "fuel_treat_overlaps_oreg_950.shp")
+
+rm(store_int_ft)
+rm(ft_fill, ft_fill_split, check)
+gc()
+
+### make loop for the first 100 treatments in oreg
+store_int_ft <- list()
+
+for (i in 1001:1100) {
+# for (i in 901:nrow(oreg)) {
+  
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get polygon
+  temp_1 <- oreg[i, ]
+
+  for (j in (i+1):(nrow(oreg))) {
+    
+    ### get polygon 2
+    temp_2 <- oreg[j, ] %>%
+      dplyr::select(ft_id_2 = ft_id_1,
+                    state_2 = state_1,
+                    activity_2 = activity_1,
+                    date_compl_2 = date_compl_1,
+                    fire_2 = fire_1,
+                    fire_source_2 = fire_source_1,
+                    fire_ig_2 = fire_ig_1,
+                    geometry)
+    
+    ### intersect
+    temp_overlap <- st_intersection(temp_1,
+                                    temp_2)
+    
+    ### make unique output index
+    uoi <- paste(i, "_", j)
+    
+    ### try another way to output
+    store_int_ft[[uoi]] <- temp_overlap
+    
+  }
+  
+}
+
+### combine sfs
+ft_fill <- do.call(rbind, store_int_ft)
+
+### remove dup row
+ft_fill <- ft_fill %>%
+  distinct()
+
+# ### remove nevada row
+# ft_fill <- ft_fill %>%
+#   filter(!state_1 == "NV")
+
+### make valid
+ft_fill <- st_make_valid(ft_fill)
+
+### fix problem shapes
+ft_fill_split <- ft_fill %>%
+  st_collection_extract()
+
+# ### are any of the objects just dropped?
+# length(unique(ft_fill$ft_id_1))
+# length(unique(ft_fill_split$ft_id_1))
+# ### yes, several ft_id_1 are dropped
+check <- ft_fill %>%
+  filter(!ft_id_1 %in% ft_fill_split$ft_id_1)
+# check[9, ] %>%
+#   ggplot() +
+#   geom_sf()
+# ### the ones that get dropped are LINESTRINGs, MULTILINESTRINGs
+
+### write out
+st_write(ft_fill_split,
+         "fuel_treat_overlaps_oreg_1100.shp")
+
+rm(store_int_ft)
+rm(ft_fill, ft_fill_split, check)
+gc()
+
+### make loop for the first 100 treatments in oreg
+store_int_ft <- list()
+
+for (i in 1101:1200) {
+# for (i in 901:nrow(oreg)) {
+  
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get polygon
+  temp_1 <- oreg[i, ]
+
+  for (j in (i+1):(nrow(oreg))) {
+    
+    ### get polygon 2
+    temp_2 <- oreg[j, ] %>%
+      dplyr::select(ft_id_2 = ft_id_1,
+                    state_2 = state_1,
+                    activity_2 = activity_1,
+                    date_compl_2 = date_compl_1,
+                    fire_2 = fire_1,
+                    fire_source_2 = fire_source_1,
+                    fire_ig_2 = fire_ig_1,
+                    geometry)
+    
+    ### intersect
+    temp_overlap <- st_intersection(temp_1,
+                                    temp_2)
+    
+    ### make unique output index
+    uoi <- paste(i, "_", j)
+    
+    ### try another way to output
+    store_int_ft[[uoi]] <- temp_overlap
+    
+  }
+  
+}
+
+### combine sfs
+ft_fill <- do.call(rbind, store_int_ft)
+
+### remove dup row
+ft_fill <- ft_fill %>%
+  distinct()
+
+# ### remove nevada row
+# ft_fill <- ft_fill %>%
+#   filter(!state_1 == "NV")
+
+### make valid
+ft_fill <- st_make_valid(ft_fill)
+
+### fix problem shapes
+ft_fill_split <- ft_fill %>%
+  st_collection_extract()
+
+# ### are any of the objects just dropped?
+# length(unique(ft_fill$ft_id_1))
+# length(unique(ft_fill_split$ft_id_1))
+# ### yes, several ft_id_1 are dropped
+check <- ft_fill %>%
+  filter(!ft_id_1 %in% ft_fill_split$ft_id_1)
+# check[9, ] %>%
+#   ggplot() +
+#   geom_sf()
+# ### the ones that get dropped are LINESTRINGs, MULTILINESTRINGs
+
+### write out
+st_write(ft_fill_split,
+         "fuel_treat_overlaps_oreg_1200.shp")
+
+rm(store_int_ft)
+rm(ft_fill, ft_fill_split, check)
+gc()
+
+### make loop for the first 100 treatments in oreg
+store_int_ft <- list()
+
+for (i in 1201:1300) {
+# for (i in 901:nrow(oreg)) {
+  
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get polygon
+  temp_1 <- oreg[i, ]
+
+  for (j in (i+1):(nrow(oreg))) {
+    
+    ### get polygon 2
+    temp_2 <- oreg[j, ] %>%
+      dplyr::select(ft_id_2 = ft_id_1,
+                    state_2 = state_1,
+                    activity_2 = activity_1,
+                    date_compl_2 = date_compl_1,
+                    fire_2 = fire_1,
+                    fire_source_2 = fire_source_1,
+                    fire_ig_2 = fire_ig_1,
+                    geometry)
+    
+    ### intersect
+    temp_overlap <- st_intersection(temp_1,
+                                    temp_2)
+    
+    ### make unique output index
+    uoi <- paste(i, "_", j)
+    
+    ### try another way to output
+    store_int_ft[[uoi]] <- temp_overlap
+    
+  }
+  
+}
+
+### combine sfs
+ft_fill <- do.call(rbind, store_int_ft)
+
+### remove dup row
+ft_fill <- ft_fill %>%
+  distinct()
+
+# ### remove nevada row
+# ft_fill <- ft_fill %>%
+#   filter(!state_1 == "NV")
+
+### make valid
+ft_fill <- st_make_valid(ft_fill)
+
+### fix problem shapes
+ft_fill_split <- ft_fill %>%
+  st_collection_extract()
+
+# ### are any of the objects just dropped?
+# length(unique(ft_fill$ft_id_1))
+# length(unique(ft_fill_split$ft_id_1))
+# ### yes, several ft_id_1 are dropped
+check <- ft_fill %>%
+  filter(!ft_id_1 %in% ft_fill_split$ft_id_1)
+# check[9, ] %>%
+#   ggplot() +
+#   geom_sf()
+# ### the ones that get dropped are LINESTRINGs, MULTILINESTRINGs
+
+### write out
+st_write(ft_fill_split,
+         "fuel_treat_overlaps_oreg_1300.shp")
+
+rm(store_int_ft)
+rm(ft_fill, ft_fill_split, check)
+gc()
+
+### make loop for the first 100 treatments in oreg
+store_int_ft <- list()
+
+for (i in 1301:1400) {
+# for (i in 901:nrow(oreg)) {
+  
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get polygon
+  temp_1 <- oreg[i, ]
+
+  for (j in (i+1):(nrow(oreg))) {
+    
+    ### get polygon 2
+    temp_2 <- oreg[j, ] %>%
+      dplyr::select(ft_id_2 = ft_id_1,
+                    state_2 = state_1,
+                    activity_2 = activity_1,
+                    date_compl_2 = date_compl_1,
+                    fire_2 = fire_1,
+                    fire_source_2 = fire_source_1,
+                    fire_ig_2 = fire_ig_1,
+                    geometry)
+    
+    ### intersect
+    temp_overlap <- st_intersection(temp_1,
+                                    temp_2)
+    
+    ### make unique output index
+    uoi <- paste(i, "_", j)
+    
+    ### try another way to output
+    store_int_ft[[uoi]] <- temp_overlap
+    
+  }
+  
+}
+
+### combine sfs
+ft_fill <- do.call(rbind, store_int_ft)
+
+### remove dup row
+ft_fill <- ft_fill %>%
+  distinct()
+
+# ### remove nevada row
+# ft_fill <- ft_fill %>%
+#   filter(!state_1 == "NV")
+
+### make valid
+ft_fill <- st_make_valid(ft_fill)
+
+### fix problem shapes
+ft_fill_split <- ft_fill %>%
+  st_collection_extract()
+
+# ### are any of the objects just dropped?
+# length(unique(ft_fill$ft_id_1))
+# length(unique(ft_fill_split$ft_id_1))
+# ### yes, several ft_id_1 are dropped
+check <- ft_fill %>%
+  filter(!ft_id_1 %in% ft_fill_split$ft_id_1)
+# check[9, ] %>%
+#   ggplot() +
+#   geom_sf()
+# ### the ones that get dropped are LINESTRINGs, MULTILINESTRINGs
+
+### write out
+st_write(ft_fill_split,
+         "fuel_treat_overlaps_oreg_1400.shp")
+
+rm(store_int_ft)
+rm(ft_fill, ft_fill_split, check)
+gc()
+
+### make loop for the first 100 treatments in oreg
+store_int_ft <- list()
+
+for (i in 1401:1500) {
+# for (i in 901:nrow(oreg)) {
+  
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get polygon
+  temp_1 <- oreg[i, ]
+
+  for (j in (i+1):(nrow(oreg))) {
+    
+    ### get polygon 2
+    temp_2 <- oreg[j, ] %>%
+      dplyr::select(ft_id_2 = ft_id_1,
+                    state_2 = state_1,
+                    activity_2 = activity_1,
+                    date_compl_2 = date_compl_1,
+                    fire_2 = fire_1,
+                    fire_source_2 = fire_source_1,
+                    fire_ig_2 = fire_ig_1,
+                    geometry)
+    
+    ### intersect
+    temp_overlap <- st_intersection(temp_1,
+                                    temp_2)
+    
+    ### make unique output index
+    uoi <- paste(i, "_", j)
+    
+    ### try another way to output
+    store_int_ft[[uoi]] <- temp_overlap
+    
+  }
+  
+}
+
+### combine sfs
+ft_fill <- do.call(rbind, store_int_ft)
+
+### remove dup row
+ft_fill <- ft_fill %>%
+  distinct()
+
+# ### remove nevada row
+# ft_fill <- ft_fill %>%
+#   filter(!state_1 == "NV")
+
+### make valid
+ft_fill <- st_make_valid(ft_fill)
+
+### fix problem shapes
+ft_fill_split <- ft_fill %>%
+  st_collection_extract()
+
+# ### are any of the objects just dropped?
+# length(unique(ft_fill$ft_id_1))
+# length(unique(ft_fill_split$ft_id_1))
+# ### yes, several ft_id_1 are dropped
+check <- ft_fill %>%
+  filter(!ft_id_1 %in% ft_fill_split$ft_id_1)
+# check[9, ] %>%
+#   ggplot() +
+#   geom_sf()
+# ### the ones that get dropped are LINESTRINGs, MULTILINESTRINGs
+
+### write out
+st_write(ft_fill_split,
+         "fuel_treat_overlaps_oreg_1500.shp")
+
+rm(store_int_ft)
+rm(ft_fill, ft_fill_split, check)
+gc()
+
+### make loop for the first 100 treatments in oreg
+store_int_ft <- list()
+
+for (i in 1501:1600) {
+# for (i in 901:nrow(oreg)) {
+  
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get polygon
+  temp_1 <- oreg[i, ]
+
+  for (j in (i+1):(nrow(oreg))) {
+    
+    ### get polygon 2
+    temp_2 <- oreg[j, ] %>%
+      dplyr::select(ft_id_2 = ft_id_1,
+                    state_2 = state_1,
+                    activity_2 = activity_1,
+                    date_compl_2 = date_compl_1,
+                    fire_2 = fire_1,
+                    fire_source_2 = fire_source_1,
+                    fire_ig_2 = fire_ig_1,
+                    geometry)
+    
+    ### intersect
+    temp_overlap <- st_intersection(temp_1,
+                                    temp_2)
+    
+    ### make unique output index
+    uoi <- paste(i, "_", j)
+    
+    ### try another way to output
+    store_int_ft[[uoi]] <- temp_overlap
+    
+  }
+  
+}
+
+### combine sfs
+ft_fill <- do.call(rbind, store_int_ft)
+
+### remove dup row
+ft_fill <- ft_fill %>%
+  distinct()
+
+# ### remove nevada row
+# ft_fill <- ft_fill %>%
+#   filter(!state_1 == "NV")
+
+### make valid
+ft_fill <- st_make_valid(ft_fill)
+
+### fix problem shapes
+ft_fill_split <- ft_fill %>%
+  st_collection_extract()
+
+# ### are any of the objects just dropped?
+# length(unique(ft_fill$ft_id_1))
+# length(unique(ft_fill_split$ft_id_1))
+# ### yes, several ft_id_1 are dropped
+check <- ft_fill %>%
+  filter(!ft_id_1 %in% ft_fill_split$ft_id_1)
+# check[9, ] %>%
+#   ggplot() +
+#   geom_sf()
+# ### the ones that get dropped are LINESTRINGs, MULTILINESTRINGs
+
+### write out
+st_write(ft_fill_split,
+         "fuel_treat_overlaps_oreg_1600.shp")
+
+rm(store_int_ft)
+rm(ft_fill, ft_fill_split, check)
+gc()
+
+### make loop for the first 100 treatments in oreg
+store_int_ft <- list()
+
+for (i in 1601:1700) {
+# for (i in 901:nrow(oreg)) {
+  
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get polygon
+  temp_1 <- oreg[i, ]
+
+  for (j in (i+1):(nrow(oreg))) {
+    
+    ### get polygon 2
+    temp_2 <- oreg[j, ] %>%
+      dplyr::select(ft_id_2 = ft_id_1,
+                    state_2 = state_1,
+                    activity_2 = activity_1,
+                    date_compl_2 = date_compl_1,
+                    fire_2 = fire_1,
+                    fire_source_2 = fire_source_1,
+                    fire_ig_2 = fire_ig_1,
+                    geometry)
+    
+    ### intersect
+    temp_overlap <- st_intersection(temp_1,
+                                    temp_2)
+    
+    ### make unique output index
+    uoi <- paste(i, "_", j)
+    
+    ### try another way to output
+    store_int_ft[[uoi]] <- temp_overlap
+    
+  }
+  
+}
+
+### combine sfs
+ft_fill <- do.call(rbind, store_int_ft)
+
+### remove dup row
+ft_fill <- ft_fill %>%
+  distinct()
+
+# ### remove nevada row
+# ft_fill <- ft_fill %>%
+#   filter(!state_1 == "NV")
+
+### make valid
+ft_fill <- st_make_valid(ft_fill)
+
+### fix problem shapes
+ft_fill_split <- ft_fill %>%
+  st_collection_extract()
+
+# ### are any of the objects just dropped?
+# length(unique(ft_fill$ft_id_1))
+# length(unique(ft_fill_split$ft_id_1))
+# ### yes, several ft_id_1 are dropped
+check <- ft_fill %>%
+  filter(!ft_id_1 %in% ft_fill_split$ft_id_1)
+# check[9, ] %>%
+#   ggplot() +
+#   geom_sf()
+# ### the ones that get dropped are LINESTRINGs, MULTILINESTRINGs
+
+### write out
+st_write(ft_fill_split,
+         "fuel_treat_overlaps_oreg_1700.shp")
+
+rm(store_int_ft)
+rm(ft_fill, ft_fill_split, check)
+gc()
+
+### make loop for the first 100 treatments in oreg
+store_int_ft <- list()
+
+for (i in 1701:1800) {
+# for (i in 901:nrow(oreg)) {
+  
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get polygon
+  temp_1 <- oreg[i, ]
+
+  for (j in (i+1):(nrow(oreg))) {
+    
+    ### get polygon 2
+    temp_2 <- oreg[j, ] %>%
+      dplyr::select(ft_id_2 = ft_id_1,
+                    state_2 = state_1,
+                    activity_2 = activity_1,
+                    date_compl_2 = date_compl_1,
+                    fire_2 = fire_1,
+                    fire_source_2 = fire_source_1,
+                    fire_ig_2 = fire_ig_1,
+                    geometry)
+    
+    ### intersect
+    temp_overlap <- st_intersection(temp_1,
+                                    temp_2)
+    
+    ### make unique output index
+    uoi <- paste(i, "_", j)
+    
+    ### try another way to output
+    store_int_ft[[uoi]] <- temp_overlap
+    
+  }
+  
+}
+
+### combine sfs
+ft_fill <- do.call(rbind, store_int_ft)
+
+### remove dup row
+ft_fill <- ft_fill %>%
+  distinct()
+
+# ### remove nevada row
+# ft_fill <- ft_fill %>%
+#   filter(!state_1 == "NV")
+
+### make valid
+ft_fill <- st_make_valid(ft_fill)
+
+### fix problem shapes
+ft_fill_split <- ft_fill %>%
+  st_collection_extract()
+
+# ### are any of the objects just dropped?
+# length(unique(ft_fill$ft_id_1))
+# length(unique(ft_fill_split$ft_id_1))
+# ### yes, several ft_id_1 are dropped
+check <- ft_fill %>%
+  filter(!ft_id_1 %in% ft_fill_split$ft_id_1)
+# check[9, ] %>%
+#   ggplot() +
+#   geom_sf()
+# ### the ones that get dropped are LINESTRINGs, MULTILINESTRINGs
+
+### write out
+st_write(ft_fill_split,
+         "fuel_treat_overlaps_oreg_1800.shp")
+
+rm(store_int_ft)
+rm(ft_fill, ft_fill_split, check)
+gc()
+
+### make loop for the first 100 treatments in oreg
+store_int_ft <- list()
+
+for (i in 1801:1900) {
+# for (i in 901:nrow(oreg)) {
+  
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get polygon
+  temp_1 <- oreg[i, ]
+
+  for (j in (i+1):(nrow(oreg))) {
+    
+    ### get polygon 2
+    temp_2 <- oreg[j, ] %>%
+      dplyr::select(ft_id_2 = ft_id_1,
+                    state_2 = state_1,
+                    activity_2 = activity_1,
+                    date_compl_2 = date_compl_1,
+                    fire_2 = fire_1,
+                    fire_source_2 = fire_source_1,
+                    fire_ig_2 = fire_ig_1,
+                    geometry)
+    
+    ### intersect
+    temp_overlap <- st_intersection(temp_1,
+                                    temp_2)
+    
+    ### make unique output index
+    uoi <- paste(i, "_", j)
+    
+    ### try another way to output
+    store_int_ft[[uoi]] <- temp_overlap
+    
+  }
+  
+}
+
+### combine sfs
+ft_fill <- do.call(rbind, store_int_ft)
+
+### remove dup row
+ft_fill <- ft_fill %>%
+  distinct()
+
+# ### remove nevada row
+# ft_fill <- ft_fill %>%
+#   filter(!state_1 == "NV")
+
+### make valid
+ft_fill <- st_make_valid(ft_fill)
+
+### fix problem shapes
+ft_fill_split <- ft_fill %>%
+  st_collection_extract()
+
+# ### are any of the objects just dropped?
+# length(unique(ft_fill$ft_id_1))
+# length(unique(ft_fill_split$ft_id_1))
+# ### yes, several ft_id_1 are dropped
+check <- ft_fill %>%
+  filter(!ft_id_1 %in% ft_fill_split$ft_id_1)
+# check[9, ] %>%
+#   ggplot() +
+#   geom_sf()
+# ### the ones that get dropped are LINESTRINGs, MULTILINESTRINGs
+
+### write out
+st_write(ft_fill_split,
+         "fuel_treat_overlaps_oreg_1900.shp")
+
+rm(store_int_ft)
+rm(ft_fill, ft_fill_split, check)
+gc()
+
+### make loop for the first 100 treatments in oreg
+store_int_ft <- list()
+
+for (i in 1901:2000) {
+# for (i in 901:nrow(oreg)) {
+  
+  ### progress bar
+  print(paste0("STEP ", i))
+  
+  ### get polygon
+  temp_1 <- oreg[i, ]
+
+  for (j in (i+1):(nrow(oreg))) {
+    
+    ### get polygon 2
+    temp_2 <- oreg[j, ] %>%
+      dplyr::select(ft_id_2 = ft_id_1,
+                    state_2 = state_1,
+                    activity_2 = activity_1,
+                    date_compl_2 = date_compl_1,
+                    fire_2 = fire_1,
+                    fire_source_2 = fire_source_1,
+                    fire_ig_2 = fire_ig_1,
+                    geometry)
+    
+    ### intersect
+    temp_overlap <- st_intersection(temp_1,
+                                    temp_2)
+    
+    ### make unique output index
+    uoi <- paste(i, "_", j)
+    
+    ### try another way to output
+    store_int_ft[[uoi]] <- temp_overlap
+    
+  }
+  
+}
+
+### combine sfs
+ft_fill <- do.call(rbind, store_int_ft)
+
+### remove dup row
+ft_fill <- ft_fill %>%
+  distinct()
+
+# ### remove nevada row
+# ft_fill <- ft_fill %>%
+#   filter(!state_1 == "NV")
+
+### make valid
+ft_fill <- st_make_valid(ft_fill)
+
+### fix problem shapes
+ft_fill_split <- ft_fill %>%
+  st_collection_extract()
+
+# ### are any of the objects just dropped?
+# length(unique(ft_fill$ft_id_1))
+# length(unique(ft_fill_split$ft_id_1))
+# ### yes, several ft_id_1 are dropped
+check <- ft_fill %>%
+  filter(!ft_id_1 %in% ft_fill_split$ft_id_1)
+# check[9, ] %>%
+#   ggplot() +
+#   geom_sf()
+# ### the ones that get dropped are LINESTRINGs, MULTILINESTRINGs
+
+### write out
+st_write(ft_fill_split,
+         "fuel_treat_overlaps_oreg_2000.shp")
+
+rm(store_int_ft)
+rm(ft_fill, ft_fill_split, check)
+gc()
+```
+
+###### test alternative code oreg
+Use 1901:2000 (fuel_treat_overlaps_oreg_2000.shp)
+```{r, warning=FALSE}
+### parallelize
+plan(multicore)
+
+### intersect in parallel
+ft_fill <- future_map_dfr(1:(nrow(oreg)-1), function(i) {
+  temp_overlap <- st_intersection(oreg[i, ],
+                                  oreg[(i+1):nrow(oreg), ])
+  temp_overlap
+}, .options = furrr_options(seed = TRUE))
+
+### remove dups
+ft_fill <- unique(ft_fill)
+
+### make all geometries valid
+ft_fill <- st_make_valid(ft_fill)
+
+### fix any remaining problematic shapes
+ft_fill_split <- st_collection_extract(ft_fill)
+
+# ### check against loop output: fuel_treat_overlaps_oreg_2000.shp
+# loop_oreg <- st_read("fuel_treat_overlaps_oreg_2000.shp")
+# 
+# ### restrict ft_fill_split to range of ft_id_1 in loop_oreg
+# ft_fill_subset <- ft_fill_split %>%
+#   filter(ft_id_1 > 98894 & ft_id_1 < 100824)
+# 
+# ### test with ft_id = 99011
+# test1 <- ft_fill_subset %>%
+#   filter(ft_id_1 == "99011" | ft_id_1.1 == "99011")
+# test2 <- loop_oreg %>%
+#   filter(ft_id_1 == "99011" | ft_id_2 == "99011")
+# 
+# ### check polys in qgis
+# st_write(test1, "test1.shp")
+# st_write(test2, "test2.shp")
+
+### it works and it is SO MUCH FASTER!!!!!
+
+### rename columns to match other states
+ft_fill_split <- ft_fill_split %>%
+  dplyr::select(ft_id_1,
+                state_1,
+                activity_1,
+                date_compl_1, 
+                fire_1, 
+                fire_source_1, 
+                fire_ig_1,
+                ft_id_2 = ft_id_1.1,
+                state_2 = state_1.1,
+                activity_2 = activity_1.1,
+                date_compl_2 = date_compl_1.1, 
+                fire_2 = fire_1.1, 
+                fire_source_2 = fire_source_1.1, 
+                fire_ig_2 = fire_ig_1.1,
+                geometry)
+
+### write out
+st_write(ft_fill_split,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_oreg_updated2.shp")
+```
+
+### wyoming
+```{r}
+### open wyoming polygons
+wyom <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/cyverse/wyom_polys.shp") %>%
+  dplyr::select(., ft_id_1 = ft_id,
+                state_1 = STATE_A,
+                activity_1 = ACTIVIT,
+                date_compl_1 = DATE_CO,
+                fire_1 = frst_fr_d,
+                fire_source_1 = frst_fr_s,
+                fire_ig_1 = fr_g_dt,
+                geometry)
+
+### intersect in parallel
+ft_fill <- future_map_dfr(1:(nrow(wyom)-1), function(i) {
+  temp_overlap <- st_intersection(wyom[i, ],
+                                  wyom[(i+1):nrow(wyom), ])
+  temp_overlap
+}, .options = furrr_options(seed = TRUE))
+
+### remove dups
+ft_fill <- unique(ft_fill)
+
+### make all geometries valid
+ft_fill <- st_make_valid(ft_fill)
+
+### fix any remaining problematic shapes
+ft_fill_split <- st_collection_extract(ft_fill)
+
+### rename columns to match other states
+ft_fill_split <- ft_fill_split %>%
+  dplyr::select(ft_id_1,
+                state_1,
+                activity_1,
+                date_compl_1, 
+                fire_1, 
+                fire_source_1, 
+                fire_ig_1,
+                ft_id_2 = ft_id_1.1,
+                state_2 = state_1.1,
+                activity_2 = activity_1.1,
+                date_compl_2 = date_compl_1.1, 
+                fire_2 = fire_1.1, 
+                fire_source_2 = fire_source_1.1, 
+                fire_ig_2 = fire_ig_1.1,
+                geometry)
+
+### write out
+st_write(ft_fill_split,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_wyom_updated2.shp")
+```
+
+
+### california
+```{r}
+### open california polygons
+cali <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/cyverse/cali_polys.shp") %>%
+  dplyr::select(., ft_id_1 = ft_id,
+                state_1 = STATE_A,
+                activity_1 = ACTIVIT,
+                date_compl_1 = DATE_CO,
+                fire_1 = frst_fr_d,
+                fire_source_1 = frst_fr_s,
+                fire_ig_1 = fr_g_dt,
+                geometry)
+
+### intersect in parallel
+ft_fill <- future_map_dfr(1:(nrow(cali)-1), function(i) {
+  temp_overlap <- st_intersection(cali[i, ],
+                                  cali[(i+1):nrow(cali), ])
+  temp_overlap
+}, .options = furrr_options(seed = TRUE))
+
+### remove dups
+ft_fill <- unique(ft_fill)
+
+### make all geometries valid
+ft_fill <- st_make_valid(ft_fill)
+
+### fix any remaining problematic shapes
+ft_fill_split <- st_collection_extract(ft_fill)
+
+### rename columns to match other states
+ft_fill_split <- ft_fill_split %>%
+  dplyr::select(ft_id_1,
+                state_1,
+                activity_1,
+                date_compl_1, 
+                fire_1, 
+                fire_source_1, 
+                fire_ig_1,
+                ft_id_2 = ft_id_1.1,
+                state_2 = state_1.1,
+                activity_2 = activity_1.1,
+                date_compl_2 = date_compl_1.1, 
+                fire_2 = fire_1.1, 
+                fire_source_2 = fire_source_1.1, 
+                fire_ig_2 = fire_ig_1.1,
+                geometry)
+
+### write out
+st_write(ft_fill_split,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_cali_updated2.shp")
+```
+
+## Temporal filter on overlaps
+How many years apart did the different, overlapping treatments occur? 
+```{r}
+### open overlaps for all states
+ariz <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_ariz_updated2.shp")
+cali <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_cali_updated2.shp")
+colo <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_colo_updated2.shp")
+idah <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_idah_updated2.shp")
+mont <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_mont_updated2.shp")
+neva <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_neva_updated2.shp")
+nmex <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_nmex_updated2.shp")
+oreg <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_oreg_updated2.shp")
+utah <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_utah_updated2.shp")
+wash <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_wash_updated2.shp")
+wyom <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_wyom_updated2.shp")
+
+### combine
+all_overlaps <- rbind(ariz, cali, colo, idah,
+                      mont, neva, nmex, oreg,
+                      utah, wash, wyom)
+
+### clean up
+rm(ariz, cali, colo, idah,
+   mont, neva, nmex, oreg,
+   utah, wash, wyom)
+
+### rename cols
+all_overlaps <- all_overlaps %>%
+  rename(activity_1 = actvt_1,
+         date_comp_1 = dt_cm_1,
+         fire_source_1 = fr_sr_1,
+         fire_ig_1 = fir_g_1,
+         activity_2 = actvt_2,
+         date_comp_2 = dt_cm_2,
+         fire_source_2 = fr_sr_2,
+         fire_ig_2 = fir_g_2)
+
+### change order of treatments to be chronological
+all_overlaps_temp <- all_overlaps %>%
+  mutate(ft_id_1_fix = ifelse(date_comp_1 < date_comp_2, 
+                              ft_id_1, ft_id_2),
+         activity_1_fix = ifelse(date_comp_1 < date_comp_2, 
+                                 activity_1, activity_2),
+         date_comp_1_fix = if_else(date_comp_1 < date_comp_2, 
+                                   date_comp_1, date_comp_2),
+         fire_1_fix = ifelse(date_comp_1 < date_comp_2,
+                             fire_1, fire_2),
+         fire_source_1_fix = ifelse(date_comp_1 < date_comp_2,
+                                    fire_source_1, fire_source_2),
+         fire_ig_1_fix = if_else(date_comp_1 < date_comp_2,
+                                 fire_ig_1, fire_ig_2),
+         ft_id_2_fix = ifelse(date_comp_1 < date_comp_2, 
+                              ft_id_2, ft_id_1),
+         activity_2_fix = ifelse(date_comp_1 < date_comp_2,
+                                 activity_2, activity_1),
+         date_comp_2_fix = if_else(date_comp_1 < date_comp_2,
+                                   date_comp_2, date_comp_1),
+         fire_2_fix = ifelse(date_comp_1 < date_comp_2,
+                             fire_2, fire_1),
+         fire_source_2_fix = ifelse(date_comp_1 < date_comp_2,
+                                    fire_source_2, fire_source_1),
+         fire_ig_2_fix = if_else(date_comp_1 < date_comp_2,
+                                 fire_ig_2, fire_ig_1)) %>%
+  dplyr::select(-ft_id_1, -ft_id_2,
+                -activity_1, -activity_2,
+                -date_comp_1, -date_comp_2,
+                -fire_1, -fire_2,
+                -fire_source_1, -fire_source_2,
+                -fire_ig_1, -fire_ig_2)
+
+### rename
+all_overlaps_temp <- all_overlaps_temp %>%
+  dplyr::select(ft_id_1 = ft_id_1_fix,
+                state_1,
+                activity_1 = activity_1_fix,
+                date_comp_1 = date_comp_1_fix,
+                fire_1 = fire_1_fix,
+                fire_source_1 = fire_source_1_fix,
+                fire_ig_1 = fire_ig_1_fix,
+                ft_id_2 = ft_id_2_fix,
+                state_2,
+                activity_2 = activity_2_fix,
+                date_comp_2 = date_comp_2_fix,
+                fire_2 = fire_2_fix,
+                fire_source_2 = fire_source_2_fix,
+                fire_ig_2 = fire_ig_2_fix)
+
+### how many years apart did the treatments occur?
+all_overlaps <- all_overlaps_temp %>%
+  
+  ### did the fuel treatments occur at the same time?
+  # mutate(year_diff = abs(date_comp_1 - date_comp_2))
+  mutate(treat_date_same = if_else(date_comp_1 == date_comp_2, 1, 0),
+         year_diff = time_length(difftime(date_comp_2,
+                                          date_comp_1), 
+                                 "years"))
+
+### what's the range here?
+range(all_overlaps$year_diff)
+### 0-38 years between treatments
+
+### how many have the same treatment date
+table(all_overlaps$treat_date_same)
+#     0     1 
+# 53305 14537 
+
+### plot this
+ggplot(data = all_overlaps,
+       aes(x = year_diff_abs)) +
+  geom_histogram(binwidth = 1) +
+  theme_bw() +
+  xlab("years between treatments") +
+  NULL
+
+### What are the overlapping treatments? Are some of these the same treatment type?
+all_overlaps <- all_overlaps %>%
+  mutate(overlap_same = ifelse(activity_1 == activity_2,
+                               1, 0))
+all_overlaps$overlap_same <- as.factor(all_overlaps$overlap_same)
+table(all_overlaps$overlap_same)
+### for 13278 of these rows (19.6%), the overlapping polygons are for the same treatment type
+
+### same treatment type and same date
+table(all_overlaps$treat_date_same, all_overlaps$overlap_same)
+### 4675 = same treatment type with same treatment date
+
+### plot this
+all_overlaps %>%
+  # filter(overlap_same == "0") %>%
+  ggplot(aes(x = year_diff_abs,
+             color = overlap_same,
+             fill = overlap_same)) +
+  geom_histogram(binwidth = 1) +
+  theme_bw() +
+  xlab("years between treatments") +
+  NULL
+
+### NOW the first treatment either happened BEFORE or AT THE SAME TIME as the second treatment
+         
+### make a column for unique ft overlap id
+all_overlaps <- all_overlaps %>%
+  mutate(overlap_id = row_number())
+
+### ft_id_1 == ft_id_2??
+all_overlaps <- all_overlaps %>%
+  mutate(same_ft = ifelse(ft_id_1 == ft_id_2, 1, 0))
+table(all_overlaps$same_ft)
+
+### look at the ones where ft_id_1 == ft_id_2
+same_ft_rows <- all_overlaps %>%
+  filter(same_ft > 0)
+
+### drop these ones
+all_overlaps <- all_overlaps %>%
+  filter(same_ft < 1)
+
+### remove that column
+all_overlaps <- all_overlaps %>%
+  dplyr::select(-same_ft)
+
+### save
+st_write(all_overlaps, 
+         "all_overlap_fts.shp")
+```
+
+#### question
+What about fuel treatments that burned in multiple fires? Do I still have multiple rows for those fuel treatments?
+```{r}
+### make version to play with
+test <- all_overlaps
+st_geometry(test) <- NULL
+
+### summarize
+test_fires <- test %>%
+  group_by(ft_id_1) %>%
+  summarise(n_occur = length(unique(fire_1)))
+range(test_fires$n_occur)
+
+### look at the fts that burned in multiple fires
+test_fires <- test_fires %>%
+  filter(n_occur > 6)
+test_overlaps <- test %>%
+  filter(ft_id_1 %in% test_fires$ft_id_1)
+
+### We have retained the rows for ft's that burned in multiple fires. Yay!
+rm(test, test_fires, test_overlaps)
+```
+The answer to the question was YES.
+
+#### wildfire relative to overlap
+```{r}
+### open all_overlaps
+all_overlaps <- st_read("all_overlap_fts.shp") %>%
+  rename(., activity_1 = actvt_1,
+         date_comp_1 = dt_cm_1, 
+         fire_source_1 = fr_sr_1, 
+         fire_ig_1 = fir_g_1, 
+         activity_2 = actvt_2, 
+         date_comp_2 = dt_cm_2, 
+         fire_source_2 = fr_sr_2, 
+         fire_ig_2 = fir_g_2, 
+         treat_date_same = trt_dt_, 
+         year_diff = yer_dff, 
+         overlap_same = ovrlp_s, 
+         overlap_id = ovrlp_d)
+
+### are fire_1 and fire_2 the same fire?
+all_overlaps <- all_overlaps %>%
+  mutate(fire_same = ifelse(fire_1 == fire_2, 1, 0))
+table(all_overlaps$fire_same)
+### for 60457 rows (91%), fire_1 = fire_2
+```
+
+##### same fire
+```{r}
+### let's just look at those rows for now
+overlap_same <- all_overlaps %>%
+  filter(fire_same > 0)
+
+### did the fire burn after BOTH fuel treatments?
+overlap_same <- overlap_same %>%
+  mutate(order_fire = ifelse(date_comp_2 < fire_ig_1, 1, 0))
+unique(overlap_same$order_fire)
+### for all of these rows, the two fuel treatments occurred before the wildfire
+
+### drop order_fire column
+overlap_same <- overlap_same %>%
+  dplyr::select(-order_fire)
+```
+
+##### diff fire same date
+```{r}
+### what about for overlapping fuel treatments that burned in different fires?
+overlap_diff <- all_overlaps %>%
+  filter(!fire_same > 0)
+
+### was the fire date the same for any of these?
+overlap_diff <- overlap_diff %>%
+  mutate(same_ig_date = ifelse(fire_ig_1 == fire_ig_2, 
+                               1, 0))
+table(overlap_diff$same_ig_date)
+### for 1666 of these, the fires have the same ignition date, so can basically treat them as the same fire for temporal purpose. This is because there are two fires (CA3985812091220200817 and CA4009112093120200817) that overlapped and had the same ignition date.
+
+### take a look at these two fires
+mtbs <- st_read("E:/fire_sev_rdd/mtbs/mtbs_perims_DD.shp") %>%
+  st_transform(crs = 6350) %>%
+  filter(., Event_ID %in% c("CA3985812091220200817",
+                            "CA4009112093120200817"))
+mtbs %>%
+  ggplot() +
+  geom_sf(aes(color = Event_ID,
+              fill = Event_ID),
+          alpha = 0.2)
+st_equals(mtbs[1, ], mtbs[2, ])
+### these two fires have the same perimeters
+
+### subset
+overlap_same_date <- overlap_diff %>%
+  filter(same_ig_date > 0)
+
+### drop same_ig_date column
+overlap_same_date <- overlap_same_date %>%
+  dplyr::select(-same_ig_date)
+
+### add these rows to overlap_same
+overlap_same <- rbind(overlap_same,
+                      overlap_same_date)
+```
+
+##### diff fire diff date
+```{r}
+### subset dataset
+diff_fires <- overlap_diff %>%
+  filter(same_ig_date < 1)
+
+### do both fires burn after both fuel treatments?
+diff_fires <- diff_fires %>%
+  mutate(fire_1_post_ft_1 = ifelse(date_comp_1 < fire_ig_1, 1, 0),
+         fire_2_post_ft_1 = ifelse(date_comp_1 < fire_ig_2, 1, 0),
+         fire_1_post_ft_2 = ifelse(date_comp_2 < fire_ig_1, 1, 0),
+         fire_2_post_ft_2 = ifelse(date_comp_2 < fire_ig_2, 1, 0))
+unique(diff_fires$fire_1_post_ft_1) # fire 1 is always after ft 1
+unique(diff_fires$fire_2_post_ft_1) # fire 2 is always after ft 1
+unique(diff_fires$fire_1_post_ft_2) # fire 1 doesn't always come after ft 2
+unique(diff_fires$fire_2_post_ft_2) # fire 2 is always after ft 2
+### fire 1 sometimes happens before treatment 2. this means that treatment 2 is functionally a separate treatment than treatment 1
+
+### if treatment 2 happens AFTER fire 1, drop these points
+diff_fires_grouped <- diff_fires %>%
+  filter(fire_1_post_ft_2 > 0)
+
+### if treatment 2 happens AFTER fire 1, treat these points differently
+diff_fires_seq <- diff_fires %>%
+  filter(fire_1_post_ft_2 < 1)
+
+### make version for ft1
+seq_1 <- diff_fires_seq %>%
+  dplyr::select(ft_id = ft_id_1, state = state_1, 
+                activity = activity_1, date_comp = date_comp_1, 
+                fire_id = fire_1, fire_source = fire_source_1, 
+                fire_ig = fire_ig_1, overlap_id, 
+                geometry)
+
+### make version for ft2
+seq_2 <- diff_fires_seq %>%
+  dplyr::select(ft_id = ft_id_2, state = state_2, 
+                activity = activity_2, date_comp = date_comp_2, 
+                fire_id = fire_2, fire_source = fire_source_2, 
+                fire_ig = fire_ig_2, overlap_id, 
+                geometry)
+
+### write out
+st_write(seq_1,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/fts_seq_1.shp")
+st_write(seq_2,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/fts_seq_2.shp")
+```
+
+##### harmonize
+```{r}
+### add column to overlap same for category
+overlap_same <- overlap_same %>%
+  mutate(category = ifelse(fire_same > 0, "same fire id", "same fire date"))
+
+### drop excess columns from diff_fires_grouped and add category column
+diff_fires_grouped <- diff_fires_grouped %>%
+  dplyr::select(-same_ig_date, -fire_1_post_ft_1,
+                -fire_2_post_ft_2, -fire_1_post_ft_2,
+                -fire_2_post_ft_1) %>%
+  mutate(category = "diff fires")
+
+### combine
+all_overlaps_comb <- rbind(overlap_same,
+                           diff_fires_grouped)
+
+### write out
+st_write(all_overlaps_comb,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/all_overlaps_temporal.shp")
+
+### column names
+# [1] "ft_id_1"         "state_1"         "activity_1"      "date_comp_1"     "fire_1"          "fire_source_1"  
+#  [7] "fire_ig_1"       "ft_id_2"         "state_2"         "activity_2"      "date_comp_2"     "fire_2"         
+# [13] "fire_source_2"   "fire_ig_2"       "treat_date_same" "year_diff"       "overlap_same"    "overlap_id"     
+# [19] "fire_same"       "category"        "geometry"
+
+### distribution of years between overlapping treatments
+ggplot(data = all_overlaps_comb,
+       aes(x = year_diff)) +
+  geom_histogram(binwidth = 1) +
+  theme_bw() +
+  xlab("years between treatments") +
+  NULL
+
+### year_diff in full years
+all_overlaps_comb <- all_overlaps_comb %>%
+  mutate(year_diff_round = round(year_diff))
+table(all_overlaps_comb$year_diff_round)
+
+### what's going on with the ones with > 10 years in between
+long_gap <- all_overlaps_comb %>%
+  filter(year_diff_round > 10)
+```
+
+## Fuel treatments vs. other activities
+```{r}
+### open poly of burned fuel treatments
+burned_ft <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/all_burned_fuel_treats_year_burned_polygons.shp") %>%
+  rename(.,
+         STATE_ABBR = STATE_A,
+         ACTIVITY_C = ACTIVITY_,
+         DATE_COMPL = DATE_CO,
+         date_comp = dat_cmp,
+         month_comp = mnth_cm,
+         year_comp = yer_cmp,
+         first_fire_id = frst_fr_d,
+         first_fire_source = frst_fr_s,
+         fire_ig_date = fr_g_dt,
+         Fire_Year = Fire_Yr,
+         Start_Day = Strt_Dy)
+
+### get full ft database
+ft <- st_read("E:/usda_2023/usfs_fuel_treatments/S_USA.Activity_HazFuelTrt_PL.shp") %>%
+  mutate(., ft_id = row_number()) %>%
+  filter(., ft_id %in% burned_ft$ft_id)
+ft <- ft %>%
+  dplyr::select(ft_id, PURPOSE_CO)
+st_geometry(ft) <- NULL
+
+### make version without geom
+burned_df <- burned_ft
+st_geometry(burned_df) <- NULL
+
+### add purpose code to ft
+burned_df <- merge(burned_df,
+                   ft, 
+                   by = "ft_id")
+
+### simplify PURPOSE_CO
+burned_df <- burned_df %>%
+  mutate(PURPOSE_CO = ifelse(PURPOSE_CO %in% c("FTM", "FTI", 
+                                               "FTF"), 
+                             "FUEL", PURPOSE_CO))
+
+### spell out purpose
+PURPOSE_CO <- c("TSI", "FUEL", "FIRE", 
+                "TMBR", "REC", "WILD", 
+                "FE", "BD", "RF")
+purpose <- c("timber_stand_improv", "fuel", "wildfire",
+             "timber_manage", "recreation", "wildlife",
+             "fisheries", "brush_disposal", "reforestation")
+purpose_codes <- data.frame(cbind(PURPOSE_CO,
+                                  purpose))
+
+### merge in 
+burned_df <- merge(burned_df,
+                   purpose_codes,
+                   by = "PURPOSE_CO",
+                   all.x = TRUE)
+
+### unique combinations of activity and treatment
+summ_burned <- burned_df %>%
+  group_by(ACTIVITY_C, ACTIVITY, TREATMENT_, purpose) %>%
+  summarise(n_occur = n())
+
+### get activity/treatment combinations
+summ_burned <- summ_burned %>%
+  filter(!is.na(TREATMENT_)) %>%
+  dplyr::select(-n_occur) %>%
+  distinct()
+
+### summarize by activity
+activities <- burned_df %>%
+  group_by(ACTIVITY_C, ACTIVITY, purpose) %>%
+  summarise(n_occur = n())
+
+### bring in treatment
+activities <- merge(activities,
+                    summ_burned,
+                    by = c("ACTIVITY",
+                           "purpose", 
+                           "ACTIVITY_C"))
+
+### reorder cols
+activities <- activities %>%
+  # dplyr::select(ACTIVITY_C, ACTIVITY, TREATMENT_, 
+  #               purpose, n_occur) %>%
+  
+  ## without purpose
+  dplyr::select(ACTIVITY_C, ACTIVITY, TREATMENT_, 
+                n_occur)
+
+### summarize
+activities <- activities %>%
+  group_by(ACTIVITY_C, ACTIVITY, TREATMENT_) %>%
+  summarise(n_occur = sum(n_occur))
+
+### write out
+write_csv(activities, "management_activities_all.csv")
+# write_csv(activities, "management_activities_all_purpose.csv")
+
+### activities that 
+```
+
+## Which fires have fuel reduction treatments?
+```{r}
+### fts that burned
+burned_ft <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/all_burned_fuel_treats_year_updated_polygons_fireID.shp")
+burned_ft <- burned_ft %>%
+  rename(STATE_ABBR = STATE_A,
+         DATE_COMP = DATE_CO,
+         date_comp = dat_cmp,
+         month_comp = mnth_cm,
+         year_comp = yer_cmp,
+         first_fire_id = frst_fr_d,
+         first_fire_source = frst_fr_s,
+         fire_ig_date = fr_g_dt)
+
+### open fire perimeter polygons
+fp <- st_read("E:/fired_py_data/fired_west_events.shp") %>%
+  filter(., id %in% burned_ft$first_fire_id) %>%
+  st_transform(., 6350) %>%
+  dplyr::select(., Fire_ID = id,
+                Fire_Year = ig_year,
+                Start_Day = ig_month, 
+                End_Day = ig_day,
+                geometry)
+mt <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/mtbs_gee.shp") %>%
+  filter(., Fire_ID %in% burned_ft$first_fire_id) %>%
+  dplyr::select(., -Incid_Type)
+
+### combine
+fires <- rbind(fp, mt)
+rm(fp, mt)
+
+### filter to treatments that are explicitly designed to reduce hazardous fuel loads
+haz_fuel_red <- burned_ft %>%
+  filter(ACTIVITY_ %in% c("1111", "1112", "1113", 
+                          "2540", "1130", "1136", 
+                          "1139", "1150", "1152", 
+                          "1153", "1154", "1160", 
+                          "1180", "2370", "4455"))
+
+### subset to fires that have these fuel treatments
+fires_hfr <- fires %>%
+  filter(Fire_ID %in% haz_fuel_red$first_fire_id)
+
+### write them out
+st_write(fires_hfr,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/fires_haz_ft.shp")
+```
+
+#### Download MTBS CBI fires
+```{r}
+### folder url
+folder_mtbs_url <- "https://drive.google.com/drive/u/3/folders/1hPYTx_mENifIuoZQXHqWQ0lfeVk7AVIb"
+
+### identify the folder
+folder_mtbs <- drive_get(as_id(folder_mtbs_url))
+
+### identify the rasters in that folder
+drive_mtbs <- drive_ls(folder_mtbs)
+
+### set download path
+mtbs_path <- "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_fuel_treat_mtbs/"
+
+### run through files to download
+for (i in seq_along(drive_mtbs$name)) {
+  drive_download(
+    as_id(drive_mtbs$id[[i]]),
+    path = file.path(mtbs_path, drive_mtbs$name[[i]]),
+    overwrite = TRUE
+  )
+}
+
+rm(drive_mtbs, folder_mtbs)
+```
+
+### Download firedpy CBI fires
+```{r}
+### folder url
+folder_firedpy_url <- "https://drive.google.com/drive/u/3/folders/1XDrOV0QSzMSWPzA0ydkawTKNQLY7f_tN"
+
+### identify the folder
+folder_firedpy <- drive_get(as_id(folder_firedpy_url))
+
+### identify the rasters in that folder
+drive_firedpy <- drive_ls(folder_firedpy)
+
+### set download path
+firedpy_path <- "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_fuel_treat_firedpy/"
+
+### run through files to download
+for (i in seq_along(drive_firedpy$name)) {
+  drive_download(
+    as_id(drive_firedpy$id[[i]]),
+    path = file.path(firedpy_path, drive_firedpy$name[[i]]),
+    overwrite = TRUE
+  )
+}
+
+rm(drive_firedpy, folder_firedpy)
+```
+
+### Sample pts for fires
+```{r}
+### open fire perimeters with fuel reduction treatments
+fires_hfr <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fires_haz_ft.shp")
+
+### drop geom
+st_geometry(fires_hfr) <- NULL
+
+### figure out fire source
+fires_hfr <- fires_hfr %>%
+  mutate(fire_source = nchar(Fire_ID)) %>%
+  mutate(fire_type = ifelse(fire_source > 20, "mtbs", "firedpy"))
+
+### add column with full file path to the fire names
+fires_hfr <- fires_hfr %>% 
+  mutate(file_name = ifelse(fire_type == "mtbs",
+                    paste0("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_fuel_treat_mtbs/", Fire_ID, "_CBI_bc.tif"),
+                    paste0(paste0("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_fuel_treat_firedpy/", Fire_ID, "_CBI_bc.tif"))))
+```
+
+#### mtbs
+```{r, warning=FALSE}
+### get path for fires
+mtbs_path <- list.files(path = "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_fuel_treat_mtbs",
+                        full.names = TRUE)
+
+### restrict mtbs_path to the fires in fires_hfr
+mtbs_path <- mtbs_path[mtbs_path %in% fires_hfr$file_name]
+
+### store pts
+store_cbi_pts <- list()
+
+### Loop through files to write out pts
+# for (i in 1:length(mtbs_path)) {
+# for (i in 1:50) {
+# for (i in 51:100) {
+# for (i in 101:150) {
+# for (i in 151:200) {
+# for (i in 201:250) {
+# for (i in 251:300) {
+# for (i in 301:350) {
+# for (i in 351:400) {
+# for (i in 401:450) {
+# for (i in 451:500) {
+# for (i in 501:550) {
+for (i in 551:length(mtbs_path)) {
+
+  ### print step
+  print(paste0("STEP ", i))
+  
+  ### open file
+  mtbs_i <- raster(mtbs_path[i])
+  
+  ### fire name
+  cbi_fire_name <- mtbs_path[i]
+  cbi_fire_name <- gsub('_CBI_bc.tif','', cbi_fire_name)
+  cbi_fire_name <- gsub('E:/usda_2023/usfs_fuel_treatments/western_us/cbi_fuel_treat_mtbs/',
+                    '', cbi_fire_name)
+
+  ### make points
+  mtbs_pt <- mtbs_i %>%
+    rasterToPoints(spatial = TRUE)
+
+  ### convert to sf
+  mtbs_pt <- st_as_sf(mtbs_pt) %>%
+    
+    ### add fire name
+    mutate(fire_id = cbi_fire_name) %>%
+    
+    ### transform
+    st_transform(6350)
+  
+  ### add to list
+  store_cbi_pts[[i]] <- mtbs_pt
+
+  # ### name for pts
+  # mtbs_name <- mtbs_path[i]
+  # mtbs_name <- gsub('_CBI_bc.tif','', mtbs_name)
+  # mtbs_name <- gsub('E:/usda_2023/usfs_fuel_treatments/western_us/cbi_fuel_treat_mtbs/',
+  #                   '', mtbs_name)
+  # 
+  # ### make output file
+  # mtbs_dir <- file.path(paste0("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts/",
+  #                              mtbs_name,
+  #                              ".shp"))
+  # 
+  # ### write out
+  # st_write(mtbs_pt,
+  #          mtbs_dir)
+  
+  rm(mtbs_i, mtbs_pt)
+}
+
+### combine sfs
+cbi_full <- do.call(rbind, store_cbi_pts)
+
+rm(store_cbi_pts)
+gc()
+
+### write out
+# st_write(cbi_full,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts/cbi_pts_mtbs_1.shp")
+# st_write(cbi_full,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts/cbi_pts_mtbs_51.shp")
+# st_write(cbi_full,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts/cbi_pts_mtbs_101.shp")
+# st_write(cbi_full,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts/cbi_pts_mtbs_151.shp")
+# st_write(cbi_full,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts/cbi_pts_mtbs_201.shp")
+# st_write(cbi_full,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts/cbi_pts_mtbs_251.shp")
+# st_write(cbi_full,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts/cbi_pts_mtbs_301.shp")
+# st_write(cbi_full,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts/cbi_pts_mtbs_351.shp")
+# st_write(cbi_full,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts/cbi_pts_mtbs_401.shp")
+# st_write(cbi_full,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts/cbi_pts_mtbs_451.shp")
+# st_write(cbi_full,
+#          "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts/cbi_pts_mtbs_501.shp")
+st_write(cbi_full,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts/cbi_pts_mtbs_551.shp")
+
+rm(cbi_full)
+gc()
+```
+
+#### look at CA4146912375220150801_CBI_bc as case study
+```{r}
+### restrict fires_hfr
+fire_CA4146912375220150801 <- fires_hfr %>%
+  filter(Fire_ID == "CA4146912375220150801")
+
+### get path for fires
+mtbs_path <- list.files(path = "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_fuel_treat_mtbs",
+                        full.names = TRUE)
+
+### restrict mtbs_path to fire_CA4146912375220150801
+mtbs_path_CA4146912375220150801 <- mtbs_path[mtbs_path %in% fire_CA4146912375220150801$file_name]
+
+### open file
+mtbs_i <- raster(mtbs_path_CA4146912375220150801)
+
+### fire name
+cbi_fire_name <- mtbs_path_CA4146912375220150801
+cbi_fire_name <- gsub('_CBI_bc.tif','', cbi_fire_name)
+cbi_fire_name <- gsub('E:/usda_2023/usfs_fuel_treatments/western_us/cbi_fuel_treat_mtbs/',
+                      '', cbi_fire_name)
+
+### make points
+mtbs_pt <- mtbs_i %>%
+  rasterToPoints(spatial = TRUE)
+
+### convert to sf
+mtbs_pt <- st_as_sf(mtbs_pt) %>%
+  
+  ### add fire name
+  mutate(fire_id = cbi_fire_name) %>%
+  
+  ### transform
+  st_transform(6350)
+
+### write out
+st_write(mtbs_pt,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts/cbi_pts_mtbs_testfire.shp")
+```
+
+## Which fuel treatments are forested?
+```{r}
+### open fuel treatment polygons
+burned_gee <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/burned_ft_gee.shp")
+
+### are there repeated ft_ids?
+length(unique(burned_gee$ft_id))
+
+### visualize
+burned_gee %>%
+  filter(ft_id == "10854") %>%
+  ggplot() +
+  geom_sf(aes(color = as.numeric(fire_year),
+              fill = as.numeric(fire_year)),
+          alpha = 0.2)
+
+### some of the rows are parts of the same polygons -- want to combine these
+combined_fts <- burned_gee %>%
+  group_by(ft_id) %>%
+  summarize(geometry = st_union(geometry))
+
+### visualize
+combined_fts %>%
+  filter(ft_id == "10854") %>%
+  ggplot() +
+  geom_sf(alpha = 0.2)
+
+### use these geometries going forward
+
+### remove geom from burned_gee
+st_geometry(burned_gee) <- NULL
+
+### drop dup rows
+burned_gee <- burned_gee %>% distinct()
+
+### there are only 19757 unique ft_id's in burned_gee -- why are there more rows than that?
+burned_summ <- burned_gee %>%
+  group_by(ft_id) %>%
+  summarise(n_rows = n()) %>%
+  filter(n_rows > 1)
+
+### look at the ones with repeats
+burned_repeats <- burned_gee %>%
+  filter(ft_id %in% burned_summ$ft_id)
+
+### make col for year_prior
+burned_gee <- burned_gee %>%
+  mutate(year_prior = as.numeric(fire_year) - 1)
+
+### merge with combined_fts
+burned_gee <- merge(x = combined_fts,
+                    y = burned_gee,
+                    by = "ft_id")
+
+### calculate ft areas
+burned_gee$ft_area <- sf::st_area(burned_gee)
+
+### make ft_area into numeric
+burned_gee <- burned_gee %>%
+  mutate(ft_area_m2 = as.numeric(ft_area))
+length(unique(burned_gee$ft_id))
+
+### restrict to fuel treatments of at least 900m2
+burned_gee_900 <- burned_gee %>%
+  filter(ft_area_m2 > 900)
+length(unique(burned_gee_900$ft_id))
+
+### in GEE, I used LCMAP to calculate the forested area (m2) for each fuel treatment in the year before the wildfire
+
+### open resulting csvs
+ft1 <- read.csv("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_forest_area/ft1_forested_area.csv")
+ft2 <- read.csv("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_forest_area/ft2_forested_area.csv")
+ft3 <- read.csv("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_forest_area/ft3_forested_area.csv")
+ft4 <- read.csv("E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_forest_area/ft4_forested_area.csv")
+
+### combine
+forest_area <- rbind(ft1, ft2, ft3, ft4)
+
+### fix cols
+forest_area <- forest_area %>%
+  dplyr::select(ft_id, forested_area = forestedArea, year_comp, year_prior)
+rm(ft1, ft2, ft3, ft4)
+
+### get total forest_area for ft_ids
+forest_area_summ <- forest_area %>%
+  distinct() %>%
+  group_by(ft_id, year_comp, year_prior) %>%
+  summarise(tot_for_area = sum(forested_area))
+
+# ### are there repeated ft_ids?
+# length(unique(burned_gee$ft_id))
+# length(unique(forest_area$ft_id))
+# 
+# ### identify repeats
+# forest_area_summ <- forest_area %>%
+#   group_by(ft_id, year_comp, year_prior) %>%
+#   summarise(n_occur = n()) %>%
+#   filter(n_occur > 1)
+# 
+# ### examine them
+# forest_area_repeats <- forest_area %>%
+#   filter(ft_id %in% forest_area_summ$ft_id)
+# 
+# burned_gee_repeats <- burned_gee %>%
+#   filter(ft_id %in% forest_area_summ$ft_id)
+
+### combine 
+burned_area <- merge(burned_gee_900,
+                    forest_area_summ,
+                    by = c("ft_id", 
+                           "year_comp",
+                           "year_prior"))
+
+### round values
+burned_area <- burned_area %>%
+  mutate(tot_for_area = round(tot_for_area),
+         ft_area_m2 = round(ft_area_m2),
+         
+         ### this means that some got rounded to 0 -- change these to 1
+         ft_area_m2 = ifelse(ft_area_m2 == 0,
+                             1, ft_area_m2))
+### 19220 fts
+
+### drop fuel treatments with 0 m2 of forest pre-fire
+burned_area <- burned_area %>%
+  filter(tot_for_area > 0)
+length(unique(burned_area$ft_id)) ## 18632
+
+### drop fuel treatments with < 900 m2 (one landsat pixel) of forest pre-fire
+burned_area <- burned_area %>%
+  filter(!tot_for_area < 900)
+length(unique(burned_area$ft_id)) ## 18297
+
+### get percent forested pre-fire
+burned_area <- burned_area %>%
+  mutate(portion_forest = tot_for_area/ft_area_m2,
+         diff = ft_area_m2 - tot_for_area)
+
+### visuals
+burned_area %>%
+  filter(ft_id == "195401") %>%
+  ggplot() +
+  geom_sf()
+
+### plot distribution of proportion of forest pre-fire
+burned_area_df <- burned_area
+st_geometry(burned_area_df) <- NULL
+burned_area_df %>%
+  filter(portion_forest < 1.00001) %>%
+  ggplot(aes(x = portion_forest)) +
+  geom_histogram() +
+  theme_bw() +
+  xlab("proportion of forest pre-fire") +
+  NULL
+
+### write out csv of ft's that have enough forest area to continue
+write_csv(burned_area_df,
+          "burned_fts_forested.csv")
+```
+
+#### Does this reduce the number of wildfires?
+```{r}
+### fts that burned
+burned_ft <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/all_burned_fuel_treats_year_updated_polygons_fireID.shp") %>%
+  rename(., STATE_ABBR = STATE_A,
+         DATE_COMP = DATE_CO,
+         date_comp = dat_cmp,
+         month_comp = mnth_cm,
+         year_comp = yer_cmp,
+         first_fire_id = frst_fr_d,
+         first_fire_source = frst_fr_s,
+         fire_ig_date = fr_g_dt)
+
+### how many fires?
+length(unique(burned_ft$first_fire_id)) 
+### 981
+
+### restrict to fts with forest
+burned_forest <- burned_ft %>%
+  filter(ft_id %in% burned_area_df$ft_id)
+
+### how many fires?
+length(unique(burned_forest$first_fire_id))
+### 932
+
+### slightly reduced...
+st_geometry(burned_forest) <- NULL
+write_csv(burned_forest, "burned_fts_forested_simp.csv")
+```
+
+#### drop sample pts from non-forest fires
+```{r}
+### open forest fts
+burned_forest <- read.csv("burned_fts_forested_simp.csv")
+
+### open first one
+pts1 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts/cbi_pts_mtbs_1.shp")
+# pts1 <- pts1 %>%
+#   filter(fire_id %in% burned_forest$first_fire_id)
+### not affected
+rm(pts1)
+
+### second
+pts2 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts/cbi_pts_mtbs_51.shp")
+pts2 <- pts2 %>%
+  filter(fire_id %in% burned_forest$first_fire_id)
+### this dropped some points
+st_write(pts2, "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts/cbi_pts_mtbs_51.shp")
+rm(pts2)
+
+### third
+pts3 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts/cbi_pts_mtbs_101.shp")
+pts3 <- pts3 %>%
+  filter(fire_id %in% burned_forest$first_fire_id)
+### this dropped some points
+st_write(pts3, "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts/cbi_pts_mtbs_101.shp")
+rm(pts3)
+
+### fourth
+pts4 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts/cbi_pts_mtbs_151.shp")
+pts4 <- pts4 %>%
+  filter(fire_id %in% burned_forest$first_fire_id)
+### this dropped some points
+st_write(pts4, "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts/cbi_pts_mtbs_151.shp")
+rm(pts4)
+
+### fifth
+pts5 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts/cbi_pts_mtbs_201.shp")
+pts5 <- pts5 %>%
+  filter(fire_id %in% burned_forest$first_fire_id)
+### this dropped some points
+st_write(pts5, "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts/cbi_pts_mtbs_201.shp")
+rm(pts5)
+
+### 6
+pts6 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts/cbi_pts_mtbs_251.shp")
+pts6 <- pts6 %>%
+  filter(fire_id %in% burned_forest$first_fire_id)
+### doesn't change
+rm(pts6)
+
+### 7
+pts7 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts/cbi_pts_mtbs_301.shp")
+pts7 <- pts7 %>%
+  filter(fire_id %in% burned_forest$first_fire_id)
+### doesn't change
+rm(pts7)
+
+### 8
+pts8 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts/cbi_pts_mtbs_351.shp")
+pts8 <- pts8 %>%
+  filter(fire_id %in% burned_forest$first_fire_id)
+st_write(pts8,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts/cbi_pts_mtbs_351.shp")
+
+### 9
+pts9 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts/cbi_pts_mtbs_401.shp")
+pts9 <- pts9 %>%
+  filter(fire_id %in% burned_forest$first_fire_id)
+### reduced pts
+st_write(pts9,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts/cbi_pts_mtbs_401.shp")
+
+### 10
+pts10 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts/cbi_pts_mtbs_451.shp")
+pts10 <- pts10 %>%
+  filter(fire_id %in% burned_forest$first_fire_id)
+### reduced pts
+st_write(pts10,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts/cbi_pts_mtbs_451.shp")
+
+### 11
+pts11 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts/cbi_pts_mtbs_501.shp")
+pts11 <- pts11 %>%
+  filter(fire_id %in% burned_forest$first_fire_id)
+### doesn't change
+rm(pts11)
+
+
+### 12
+pts12 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts/cbi_pts_mtbs_551.shp")
+pts12 <- pts12 %>%
+  filter(fire_id %in% burned_forest$first_fire_id)
+### reduces points
+st_write(pts12, 
+         "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts/cbi_pts_mtbs_551.shp")
+```
+
+## CBI rasters
+Make version of CBI rasters where the file name is just the fire id
+```{r}
+### rename files to drop "_CBI_bc"
+### put files in a new folder (E:/usda_2023/usfs_fuel_treatments/western_us/cbi_mtbs_firedpy) in case something goes wrong
+file.rename(list.files(path = "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_mtbs_firedpy",
+                          pattern = "*_CBI_bc.tif",
+                          full.names = TRUE), 
+            str_replace(list.files(path = "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_mtbs_firedpy",
+                          pattern = "*_CBI_bc.tif",
+                          full.names = TRUE), 
+                        pattern = "_CBI_bc", ""))
+```
+
+## Get non-overlapping fts (all of the state's fts - overlapping fts)
+```{r}
+### open overlaps
+overlaps_ft <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/all_overlaps_temporal.shp")
+
+### get col names
+colnam <- c("ft_id_1", "state_1", "activity_1", "date_comp_1", "fire_1", "fire_source_1",   
+            "fire_ig_1", "ft_id_2", "state_2", "activity_2", "date_comp_2", "fire_2",          
+            "fire_source_2", "fire_ig_2", "treat_date_same", "year_diff", "overlap_same", "overlap_id",      
+            "fire_same", "category", "geometry")
+
+### rename cols
+colnames(overlaps_ft) <- colnam
+
+### open full burned ft dataset
+all_burned_ft <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/all_burned_fuel_treats_year_burned_polygons.shp")
+
+### get col names
+colnam2 <- c("ft_id", "state", "activity_code", "activity", "treatment", "treatment_detail",
+             "date_comp", "day_comp", "month_comp", "year_comp",
+             "first_fire_id", "first_fire_source", "fire_ig_date",
+             "fire_id", "fire_year", "start_day", "end_day", "geometry")
+
+### rename cols
+colnames(all_burned_ft) <- colnam2
+
+### try dropping intersections
+no_intersect <- rmapshaper::ms_erase(all_burned_ft, overlaps_ft)
+
+### write out
+st_write(no_intersect, "E:/usda_2023/usfs_fuel_treatments/western_us/fts_without_overlapping_sections.shp")
+```
+
+
+
+## COMBINE overlapping fts
+```{r}
+### open shp of overlapping fts (from "temporal filter on overlaps" section of code)
+overlaps_ft <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/all_overlaps_temporal.shp")
+
+### fix col names
+colnam <- c("ft_id_1", "state_1", "activity_1", "date_comp_1", "fire_1", "fire_source_1",   
+            "fire_ig_1", "ft_id_2", "state_2", "activity_2", "date_comp_2", "fire_2",          
+            "fire_source_2", "fire_ig_2", "treat_date_same", "year_diff", "overlap_same", "overlap_id",      
+            "fire_same", "category", "geometry")
+
+### rename columns
+colnames(overlaps_ft) <- colnam
+
+### col for years
+# overlaps_ft <- overlaps_ft %>%
+#   mutate(ft_id_1_yr = year(date_comp_1),
+#          ft_id_2_yr = year(date_comp_2))
+# 
+# ### are any of these the same activity, same year, same fire?
+# check_same <- overlaps_ft %>%
+#   filter(activity_1 == activity_2 &
+#            treat_date_same > 0 &
+#            fire_same > 0)
+
+### do any of these exactly overlap?
+### test with fts that I know have exact overlap: 85596, 86001, 83980
+test_check <- overlaps_ft %>% 
+  filter(fire_1 == "ID4485611430720180802" | fire_2 == "ID4485611430720180802")
+
+# ggplot() + geom_sf(data = test_check, aes(color = ft_id_1, fill = ft_id_1))
+# st_equals(test_check, sparse = FALSE)
+
+
+### try using self-join
+overlap_df <- st_join(overlaps_ft,
+                      overlaps_ft,
+                      join = st_equals)
+
+### drop rows with same overlap_id
+overlap_df <- overlap_df %>%
+  filter(!overlap_id.x == overlap_id.y)
+
+### try something
+overlap_df <- overlap_df %>%
+  mutate(ft_a = pmin(ft_id_1.x, ft_id_2.x, ft_id_1.y, ft_id_2.y),
+         ft_b = pmin(pmax(ft_id_1.x, ft_id_2.x),
+                                 pmax(pmin(ft_id_1.x, ft_id_2.x),
+                                      pmax(ft_id_1.y, ft_id_2.y))),
+         ft_c = pmax(pmin(ft_id_1.x, ft_id_2.x),
+                                pmin(pmax(ft_id_1.x, ft_id_2.x),
+                                     pmin(ft_id_1.y, ft_id_2.y))),
+         ft_d = pmax(ft_id_1.x, ft_id_2.x, ft_id_1.y, ft_id_2.y))
+
+### combine cols
+overlap_df <- overlap_df %>%
+  mutate(composite_ft = paste0(ft_a, "_", ft_b, "_",
+                               ft_c, "_", ft_d))
+
+### how many of these are all the same fire?
+overlap_df_1fire <- overlap_df %>%
+  filter(fire_1.x == fire_2.x &
+           fire_1.x == fire_1.y &
+           fire_1.x == fire_2.y)
+### these ones represent completely overlapping fuel treatments that burned in the same fire. did all the treatments occur before the fire?
+overlap_df_1fire <- overlap_df_1fire %>%
+  mutate(all_ft_before_fire = ifelse((date_comp_1.x < fire_ig_1.x &
+                                       date_comp_2.x < fire_ig_1.x &
+                                       date_comp_1.y < fire_ig_1.x &
+                                       date_comp_2.y < fire_ig_1.x),
+                                     1, 0))
+table
+### yes, all of the fts happened before the fire
+
+### what about the ones with different fires?
+overlap_df_diff_fires <- overlap_df %>%
+  filter(!composite_ft %in% overlap_df_1fire$composite_ft)
+
+
+```
+

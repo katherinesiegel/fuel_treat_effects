@@ -1,0 +1,75 @@
+---
+title: "update_mtbs"
+output: html_document
+date: "2024-03-06"
+---
+
+## Set up
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+### Load packages
+library(tidyverse)
+library(sf)
+library(lubridate)
+library(raster)
+# library(terra)
+# library(viridis)
+# library(scales)
+library(lwgeom)
+# library(googledrive)
+```
+
+### MTBS fire perimeters 
+#### subset to western US and 2021-2022
+```{r}
+### open all fires
+mtbs <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/mtbs_through_2022/mtbs_perims_DD.shp") %>%
+  st_transform(., 
+               crs = 6350) %>%
+  
+  ### make column for year
+  mutate(ig_year = year(Ig_Date)) %>%
+  
+  ### filter to 2021-2022
+  filter(ig_year > 2020)
+  
+
+### get column for state
+mtbs <- mtbs %>%
+  mutate(state = stringr::str_extract(Event_ID, "^.{2}"))
+
+### filter to western US and surrounding states
+mtbs <- mtbs %>%
+  filter(state %in% c("AZ", "CA", "CO", "ID", "MT", "NM",
+                      "NV", "OR", "UT", "WA", "WY", "ND",
+                      "SD", "NE", "KS", "OK", "TX"))
+
+
+### open western states
+w_borders <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/west_states.shp")
+
+### intersect with western US boundaries
+mtbs <- st_intersection(mtbs, w_borders)
+
+### reduce cols
+mtbs <- mtbs %>%
+  dplyr::select(Event_ID, Incid_Type, 
+                Ig_Date, geometry)
+
+### drop prescribed fires
+mtbs <- mtbs %>%
+  filter(!Incid_Type == "Prescribed Fire")
+
+### Separate out year as column
+mtbs <- mtbs %>%
+  mutate(date = day(Ig_Date),
+         month = month(Ig_Date),
+         year = year(Ig_Date))
+
+### Write out
+st_write(mtbs,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/mtbs_2021_2022_west.shp")
+
+rm(w_borders)
+```
