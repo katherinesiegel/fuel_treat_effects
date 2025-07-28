@@ -1,5 +1,10 @@
 # fuel_treat_effects
 
+## To do:
+- currently, overlaps only include fires through 2019. update_mtbs.Rmd makes MTBS file for whole time series (through 2022: "E:/usda_2023/usfs_fuel_treatments/western_us/mtbs_1984_2022_west.shp"). Eventually want to run fuel treatment overlaps with the full fire time series
+- also need to restrict control points to USFS land so not comparing across land ownership types
+
+
 ## Table of contents
 
 * update_fuel_treat_cbi.Rmd: Katherine's code for adding composite burn index values to sample points + identifying relevant wildfires  
