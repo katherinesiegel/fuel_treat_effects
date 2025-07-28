@@ -1,0 +1,230 @@
+---
+title: "morpho"
+output: html_document
+date: "2024-03-06"
+---
+
+### set up
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(sf)
+library(dplyr)
+```
+
+### get Yuba and Plumas wcs landscapes
+https://data.fs.usda.gov/geodata/edw/edw_resources/meta/S_USA.BdyPln_BIL_LandscpInvestment.xml
+```{r}
+### open wcs shapefiles
+wcs <- st_read("C:/Users/kjsie/Documents/Morpho/wcs_landscapes/S_USA.BdyPln_BIL_LandscpInvestment.shp")
+
+
+### filter to north yuba and plumas
+wcs <- wcs %>%
+  filter(NAME %in% c("North Yuba", "Plumas Community Protection"))
+# ggplot() + geom_sf(data = wcs)
+
+### reproject
+wcs <- wcs %>%
+  st_transform(6350)
+
+### open rx fires in CA that have been burned in wildfires
+rx_ft <- st_read("burned_rxfire.shp")
+
+### get rx fts inside wcs
+rx_wcs <- st_intersection(rx_ft, wcs)
+
+ggplot() +
+  geom_sf(data = wcs, color = "orange", fill = "orange", alpha = 0.2) +
+  # geom_sf(data = rx_ft, color = "gray", fill = "gray") +
+  geom_sf(data = rx_wcs, color = "black", fill = "black", alpha = 0.2) +
+  theme_void()
+
+ggplot() +
+  geom_sf(data = rx_wcs, color = "red", fill = "red", alpha = 0.2) +
+  theme_void()
+
+
+### some of these rx fires are the same
+distinct_plumas <- rx_ft %>% filter(ft_id %in% rx_wcs$ft_id)
+
+### drop fire column
+distinct_plumas <- distinct_plumas %>%
+  dplyr::select(-fire_id) %>%
+  distinct()
+
+burned_ft <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/all_burned_fuel_treats_year_updated_polygons.shp") %>%
+  filter(., ft_id %in% distinct_plumas$ft_id)
+
+### save output
+st_write(burned_ft, "C:/Users/kjsie/Documents/Morpho/wcs_landscapes/burned_rx_plumas.shp")
+
+
+ggplot() +
+  geom_sf(data = burned_ft, color = "red", fill = "red", alpha = 0.2) +
+  theme_void()
+```
+
+### Colorado Front Range
+```{r}
+### open wcs shapefiles and subset to front range
+frontrange <- st_read("C:/Users/kjsie/Documents/Morpho/wcs_landscapes/S_USA.BdyPln_BIL_LandscpInvestment.shp") %>%
+  filter(., NAME == "Colorado Front Range") %>%
+  st_transform(., crs = 6350)
+
+### open burned_fts
+burned_ft <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/all_burned_fuel_treats_year_updated_polygons.shp")
+
+### subset to CO and rx fire
+co_rx <- burned_ft %>%
+  filter(STATE_ABBR == "CO") %>%
+  filter(ACTIVITY_C %in% c("1111", "1113", "2540"))
+
+### intersect with front range
+co_rx_wcs <- st_intersection(co_rx, frontrange)
+
+### visualize
+ggplot() +
+  geom_sf(data = frontrange, color = "lightgreen", fill = "lightgreen", alpha = 0.2) +
+  # geom_sf(data = rx_ft, color = "gray", fill = "gray") +
+  geom_sf(data = co_rx_wcs, color = "black", fill = "black", alpha = 0.2) +
+  theme_void()
+
+### clean up
+co_rx_wcs_clean <- co_rx %>%
+  filter(ft_id %in% co_rx_wcs$ft_id)
+
+### write out
+st_write(co_rx_wcs_clean,
+         "C:/Users/kjsie/Documents/Morpho/wcs_landscapes/burned_rx_frontrange.shp")
+```
+
+### Prescribed fires in the Yuba (that didn't burn)
+
+
+### all Yuba and Plumas wildfires and prescribed fires
+#### wildfires
+```{r}
+### open wcs shapefiles
+yub_plum <- st_read("C:/Users/kjsie/Documents/Morpho/wcs_landscapes/S_USA.BdyPln_BIL_LandscpInvestment.shp") %>%
+  
+  ### filter to North Yuba and Plumas
+  filter(.,
+         NAME %in% c("North Yuba", "Plumas Community Protection")) %>%
+  
+  ### reproject
+  st_transform(., crs = 6350)
+
+### open mtbs polygons through 2020
+mt <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/mtbs_gee.shp")
+
+### add state column and filter to CA
+mt <- mt %>%
+  mutate(state = stringr::str_extract(Fire_ID, "^.{2}")) %>%
+  filter(state == "CA")
+
+### open 2021 and 2022 mtbs
+mt_22 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/mtbs_2021_2022_west.shp")
+
+### add state column and filter to CA
+mt_22 <- mt_22 %>%
+  mutate(state = stringr::str_extract(Event_ID, "^.{2}")) %>%
+  filter(state == "CA")
+
+### add columns for start day and end day
+mt_22 <- mt_22 %>%
+  mutate(Start_Day = "152",
+         End_Day = "258")
+
+### rearrange columns
+mt_22 <- mt_22 %>%
+  dplyr::select(Fire_ID = Event_ID,
+                Incid_Type, 
+                Fire_Year = year, 
+                Start_Day, End_Day,
+                Incid_Type,
+                geometry, 
+                state)
+
+### combine
+mt_all <- rbind(mt, mt_22)
+
+### wildfires in yub_plum
+yp_mt <- st_intersection(mt_all, yub_plum)
+
+### get full fire perimeters
+yp_mt <- mt_all %>%
+  filter(Fire_ID %in% yp_mt$Fire_ID)
+
+# ### open rx fires in CA that have been burned in wildfires
+# rx_ft <- st_read("burned_rxfire.shp")
+# 
+# ### get rx fts inside wcs
+# rx_wcs <- st_intersection(rx_ft, wcs)
+
+ggplot() +
+  geom_sf(data = yub_plum, color = "gray", fill = "gray", alpha = 0.2) +
+  # geom_sf(data = rx_ft, color = "gray", fill = "gray") +
+  # geom_sf(data = yp_mt, color = "red", fill = "red", alpha = 0.2) +
+  geom_sf(data = yp_mt, aes(color = Fire_Year, fill = Fire_Year), alpha = 0.2) +
+  theme_void()
+
+### write out wildfire perimeters
+st_write(yp_mt, 
+         "C:/Users/kjsie/Documents/Morpho/wcs_landscapes/all_mtbsfires_yubaplumas.shp")
+```
+
+#### rx fires burned in wildfires before 2021
+```{r}
+### open rx fires in CA that have been burned in wildfires
+rx_ft <- st_read("burned_rxfire.shp")
+
+### get rx fts inside wcs
+rx_wcs <- st_intersection(rx_ft, yub_plum)
+
+### get full perimeter for rx fire
+ft <- st_read("E:/usda_2023/usfs_fuel_treatments/S_USA.Activity_HazFuelTrt_PL.shp") 
+
+### add column for unique identifier, then filter to ft_id in rx_wcs
+ft <- ft %>%
+  mutate(ft_id = row_number()) %>%
+  filter(ft_id %in% rx_wcs$ft_id)
+
+ggplot() +
+  geom_sf(data = yub_plum, color = "gray", fill = "gray", alpha = 0.2) +
+  geom_sf(data = ft, color = "black", fill = "black") +
+  # geom_sf(data = yp_mt, color = "red", fill = "red", alpha = 0.2) +
+  geom_sf(data = yp_mt, aes(color = Fire_Year, fill = Fire_Year), alpha = 0.2) +
+  theme_void()
+
+### simplify columns and combine
+ft <- ft %>%
+  dplyr::select(ft_id, geometry)
+
+### combine with rx_wcs
+st_geometry(rx_wcs) <- NULL
+rx_wcs <- rx_wcs %>%
+  distinct() %>%
+  filter(!fire_id %in% "CA3985812091220200817")
+rx_wcs_ft <- merge(ft, rx_wcs, by = "ft_id", all.x = TRUE)
+
+### save output
+st_write(rx_wcs_ft, "C:/Users/kjsie/Documents/Morpho/wcs_landscapes/burned_rx_plumas_through2020.shp")
+```
+
+#### rx fires burned in wildfires post 2021
+```{r}
+### get FTs
+ft <- st_read("E:/usda_2023/usfs_fuel_treatments/S_USA.Activity_HazFuelTrt_PL.shp") %>%
+  mutate(., ft_id = row_number()) %>%
+  filter(., STATE_ABBR == "CA")
+
+### write out intermediary
+st_write(ft,
+         "C:/Users/kjsie/Documents/Morpho/wcs_landscapes/all_ca_fts.shp")
+
+### filter to rx fire
+
+```
+
