@@ -315,14 +315,14 @@ ft_fill <- ft_fill %>%
   dplyr::select(ft_id_1 = ft_id, 
                 state_1 = STATE_ABBR,
                 activity_1 = ACTIVITY,
-                date_compl_1 = DATE_COMPL,
+                date_compl_1 = date_comp,
                 fire_1 = first_fire_id,
                 fire_source_1 = first_fire_source,
                 fire_ig_1 = fire_ig_date,
                 ft_id_2 = ft_id.1,
                 state_2 = STATE_ABBR.1,
                 activity_2 = ACTIVITY.1,
-                date_compl_2 = DATE_COMPL.1,
+                date_compl_2 = date_comp.1,
                 fire_2 = first_fire_id.1,
                 fire_source_2 = first_fire_source.1,
                 fire_ig_2 = fire_ig_date.1,
@@ -339,7 +339,7 @@ for (i in 1:nrow(test_neva)) {
     dplyr::select(ft_id_1 = ft_id, 
                 state_1 = STATE_ABBR,
                 activity_1 = ACTIVITY,
-                date_compl_1 = DATE_COMPL,
+                date_compl_1 = date_comp,
                 fire_1 = first_fire_id,
                 fire_source_1 = first_fire_source,
                 fire_ig_1 = fire_ig_date,
@@ -357,7 +357,7 @@ for (i in 1:nrow(test_neva)) {
       dplyr::select(ft_id_2 = ft_id,
                     state_2 = STATE_ABBR,
                     activity_2 = ACTIVITY,
-                    date_compl_2 = DATE_COMPL,
+                    date_compl_2 = date_comp,
                     fire_2 = first_fire_id,
                     fire_source_2 = first_fire_source,
                     fire_ig_2 = fire_ig_date,
@@ -437,7 +437,7 @@ ggplot() +
 
 # write out
 st_write(ft_fill_split,
-         "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps_neva_updated2.shp")
+         "E:/usda_2023/usfs_fuel_treatments/western_us/fuel_treat_overlaps/neva.shp")
 
 ### clean up
 rm(ft_fill, ft_fill_split, temp_1,
