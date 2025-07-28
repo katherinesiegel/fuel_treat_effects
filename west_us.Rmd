@@ -25,7 +25,6 @@ library(googledrive)
 
 Workflow
 -	Restrict USFS fuel treatment polygons to western US
-o	Drop grazing and chemical 
 -	Subset MTBS to western US
 o	Drop prescribed fires from MTBS
 -	Intersect fuel treatments with subsequent wildfires 
@@ -5223,7 +5222,8 @@ ca_co_summ <- ft_burned_summ %>%
 write_csv(ca_co_summ,
           "E:/usda_2023/usfs_fuel_treatments/western_us/ft_summary_ca_co.csv")
 ```
-## UPDATE WITH ANIMALS AND CHEMICAL FROM HERE
+
+## UPDATE update_mtbs.Rmd FROM HERE
 ### Burned footprints subset to fire perimeter
 ```{r, warning = FALSE}
 ### Open csv of all burned footprints
@@ -5467,7 +5467,6 @@ for (i in seq_along(drive_mtbs$name)) {
   )
 }
 ```
-
 ## FiredPy
 ```{r}
 ### open western US firedpy events

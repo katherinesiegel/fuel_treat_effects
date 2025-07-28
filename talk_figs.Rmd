@@ -15,7 +15,7 @@ library(lubridate)
 library(raster)
 library(terra)
 library(stars)
-# library(viridis)
+library(viridis)
 # library(scales)
 library(lwgeom)
 library(googledrive)
@@ -25,6 +25,7 @@ library(units)
 library(stringr)
 library(rmapshaper)
 library(rgdal)
+library(RColorBrewer)
 ```
 
 ### inset: Graves Mountain Fire in WA in 2015
@@ -71,16 +72,23 @@ ggsave("ex_fire_esiil.png")
 ### open CBI
 cbi_wa <- raster("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_mtbs_firedpy/WA4863311833720150814.tif")
 
+### reproject
+cbi_wa_rp <- projectRaster(cbi_wa, crs = 6350,
+                           method = "bilinear") 
+
 ### convert to df
-cbi_df <- as.data.frame(cbi_wa, xy = TRUE) %>%
+cbi_df <- as.data.frame(cbi_wa_rp, xy = TRUE) %>%
   na.omit() 
 
 ### plot
 ggplot() +
-  geom_raster(data = cbi_df, aes(x = x, y = y, fill = "CBI_bc")) +
+  geom_raster(data = cbi_df, aes(x = x, y = y, fill = CBI_bc)) +
+  # scale_fill_viridis_c(option = "B") +
+  scale_fill_gradient(low = "#FEF6F2", high = "red3") +
   geom_sf(data = burned_ft, fill = NA, color = "black", lwd = 1) +
   geom_sf(data = wa_fire, fill = NA, color = "black", lwd = 2) +
   theme_void()
+ggsave("C:/Users/kjsie/Documents/scoping/graves_fire_cbi.png")
 ```
 
 ## map of fires
@@ -128,6 +136,53 @@ ggplot() +
   theme_void()
 ggsave("fires_since2012_fts.png")
 ```
+
+## fig for Brown talk
+```{r}
+### us boundary
+w_us <- st_read("E:/fire_sev_rdd/w_states.shp") %>%
+  st_transform(.,
+               crs = 4269)
+
+### open fires
+mtbs <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/mtbs_gee.shp") %>%
+  st_transform(.,
+               crs = 4269)
+mtbs2 <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/mtbs_through_2022/mtbs_gee.shp") %>%
+  st_transform(.,
+               crs = 4269)
+
+### combine fires
+mtbs_all <- rbind(mtbs, mtbs2)
+
+### open burned fts
+ft <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/burned_ft_2022/all_burned_fts_polygons.shp") %>%
+  st_transform(.,
+               crs = 4269)
+
+# ### update crs
+# w_us <- w_us %>%
+#   st_transform(crs = 5069)
+# fires_hfr <- fires_hfr %>%
+#   st_transform(crs = 5069)
+
+### map
+ggplot() +
+  geom_sf(data = w_us, 
+          fill = NA,
+          color = "black") +
+  geom_sf(data = mtbs_all,
+          color = "red3",
+          fill = "red3") +
+  geom_sf(data = ft,
+          color = "black",
+          fill = NA) +
+  theme_void()
+ggsave("all_mtbs_fires_fts.png")
+```
+
+
+
 ## western fire
 ```{r}
 w_pts <- st_read("E:/labcomp_wf_resample_1km/all_states_pts.shp")
@@ -229,3 +284,257 @@ writeRaster(elev, "gee_elev.tif")
 writeRaster(slope, "gee_slope.tif")
 ```
 
+### fire map for fires in sample pts
+### inset: Graves Mountain Fire in WA in 2015
+```{r}
+### open fire perimeters with fuel reduction treatments
+fires_hfr <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fires_haz_ft.shp") 
+
+### subset to fires in the trial pts
+test_fire <- fires_hfr %>% filter(Fire_ID %in% c("CA3312011695319931027",
+                                                 "CA3779911892220160804", 
+                                                 "ID4485611430720180802", 
+                                                 "NM3288810780920130607",
+                                                 "OR4428411896120150812"))
+
+### clean
+rm(fires_hfr)
+gc()
+
+### fts that burned
+burned_ft <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/all_burned_fuel_treats_year_updated_polygons_fireID.shp") %>%
+  rename(., STATE_ABBR = STATE_A,
+         activity_code = ACTIVITY_,
+         activity = ACTIVITY,
+         treatment = TREATMENT_,
+         DATE_COMP = DATE_CO,
+         date_comp = dat_cmp,
+         month_comp = mnth_cm,
+         year_comp = yer_cmp,
+         first_fire_id = frst_fr_d,
+         first_fire_source = frst_fr_s,
+         fire_ig_date = fr_g_dt) %>%
+  filter(., first_fire_id %in% c("CA3312011695319931027",
+                                 "CA3779911892220160804", 
+                                 "ID4485611430720180802", 
+                                 "NM3288810780920130607",
+                                 "OR4428411896120150812"))
+```
+
+#### CA3312011695319931027
+```{r}
+### test fire 1
+tf1 <- test_fire %>%
+  filter(Fire_ID == "CA3312011695319931027")
+
+# ggplot() +
+#   geom_sf(data = tf1, fill = NA, color = "black", lwd = 1)
+
+
+### fts
+ft_1 <- burned_ft %>% 
+  filter(first_fire_id %in% tf1$Fire_ID)
+
+# ggplot() +
+#   geom_sf(data = tf1, fill = NA, color = "black", lwd = 1) +
+#   geom_sf(data = ft_1, fill = NA, color = "lightblue", lwd = 1)
+
+
+# ### simplify -- keep 1
+# burned_ft <- burned_ft %>%
+#   filter(ft_id == "139871")
+
+# ### intersect
+# burned_ft <- st_intersection(burned_ft, wa_fire)
+
+### plot
+ggplot() +
+    geom_sf(data = ft_1, fill = "lightskyblue3", color = NA) +
+  geom_sf(data = tf1, fill = NA, color = "black", lwd = 2) +
+  theme_void()
+# ggsave("ex_fire_esiil.png")
+
+### open CBI
+cbi_t1 <- raster("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_mtbs_firedpy/CA3312011695319931027.tif")
+
+### reproject
+cbi_t1 <- projectRaster(cbi_t1, crs = 6350,
+                        method = "bilinear") 
+
+### convert to df
+cbi_t1 <- as.data.frame(cbi_t1, xy = TRUE) %>%
+  na.omit() 
+
+### plot
+ggplot() +
+  geom_raster(data = cbi_t1, aes(x = x, y = y, fill = CBI_bc)) +
+  # scale_fill_viridis_c(option = "B") +
+  scale_fill_gradient(low = "#FEF6F2", high = "red3") +
+  geom_sf(data = ft_1, fill = NA, color = "black", lwd = 1) +
+  geom_sf(data = tf1, fill = NA, color = "black", lwd = 2) +
+  theme_void()
+ggsave("C:/Users/kjsie/Documents/scoping/graves_fire_cbi.png")
+```
+
+#### CA3779911892220160804
+```{r}
+### test fire 1
+tf2 <- test_fire %>%
+  filter(Fire_ID == "CA3779911892220160804")
+
+# ggplot() +
+#   geom_sf(data = tf2, fill = NA, color = "black", lwd = 1)
+
+
+### fts
+ft_2 <- burned_ft %>% 
+  filter(first_fire_id %in% tf2$Fire_ID)
+
+ggplot() +
+  geom_sf(data = tf2, fill = NA, color = "black", lwd = 1) +
+  geom_sf(data = ft_2, fill = NA, color = "lightblue", lwd = 1)
+
+
+# ### simplify -- keep 1
+# burned_ft <- burned_ft %>%
+#   filter(ft_id == "139871")
+
+# ### intersect
+# burned_ft <- st_intersection(burned_ft, wa_fire)
+
+### plot
+ggplot() +
+    geom_sf(data = ft_1, fill = "lightskyblue3", color = NA) +
+  geom_sf(data = tf1, fill = NA, color = "black", lwd = 2) +
+  theme_void()
+# ggsave("ex_fire_esiil.png")
+
+### open CBI
+cbi_t2 <- raster("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_mtbs_firedpy/CA3779911892220160804.tif")
+
+### reproject
+cbi_t2 <- projectRaster(cbi_t2, crs = 6350,
+                        method = "bilinear") 
+
+### convert to df
+cbi_t2 <- as.data.frame(cbi_t2, xy = TRUE) %>%
+  na.omit() 
+
+### plot
+ggplot() +
+  geom_raster(data = cbi_t2, aes(x = x, y = y, fill = CBI_bc)) +
+  # scale_fill_viridis_c(option = "B") +
+  scale_fill_gradient(low = "#FEF6F2", high = "red3") +
+  geom_sf(data = ft_2, fill = NA, color = "black", lwd = 1) +
+  geom_sf(data = tf2, fill = NA, color = "black", lwd = 2) +
+  theme_void()
+ggsave("C:/Users/kjsie/Documents/scoping/graves_fire_cbi.png")
+```
+
+#### ID4485611430720180802", 
+```{r}
+### test fire 1
+tf3 <- test_fire %>%
+  filter(Fire_ID == "ID4485611430720180802")
+
+ggplot() +
+  geom_sf(data = tf3, fill = NA, color = "black", lwd = 1)
+
+
+### fts
+ft_3 <- burned_ft %>% 
+  filter(first_fire_id %in% tf3$Fire_ID)
+
+ggplot() +
+  geom_sf(data = tf3, fill = NA, color = "black", lwd = 1) +
+  geom_sf(data = ft_3, fill = NA, color = "lightblue", lwd = 1)
+```
+
+#### NM3288810780920130607
+```{r}
+### test fire 1
+tf4 <- test_fire %>%
+  filter(Fire_ID == "NM3288810780920130607")
+
+ggplot() +
+  geom_sf(data = tf4, fill = NA, color = "black", lwd = 1)
+
+
+### fts
+ft_4 <- burned_ft %>% 
+  filter(first_fire_id %in% tf4$Fire_ID)
+
+ggplot() +
+  geom_sf(data = tf4, fill = NA, color = "black", lwd = 1) +
+  geom_sf(data = ft_4, fill = NA, color = "lightblue", lwd = 1)
+
+
+# ### simplify -- keep 1
+# burned_ft <- burned_ft %>%
+#   filter(ft_id == "139871")
+
+# ### intersect
+# burned_ft <- st_intersection(burned_ft, wa_fire)
+
+### plot
+ggplot() +
+    geom_sf(data = ft_1, fill = "lightskyblue3", color = NA) +
+  geom_sf(data = tf1, fill = NA, color = "black", lwd = 2) +
+  theme_void()
+# ggsave("ex_fire_esiil.png")
+```
+
+#### OR4428411896120150812
+```{r}
+### test fire 1
+tf5 <- test_fire %>%
+  filter(Fire_ID == "OR4428411896120150812")
+
+ggplot() +
+  geom_sf(data = tf5, fill = NA, color = "black", lwd = 1)
+
+
+### fts
+ft_5 <- burned_ft %>% 
+  filter(first_fire_id %in% tf5$Fire_ID)
+
+ggplot() +
+  geom_sf(data = tf5, fill = NA, color = "black", lwd = 1) +
+  geom_sf(data = ft_5, fill = NA, color = "lightblue", lwd = 1)
+
+
+# ### simplify -- keep 1
+# burned_ft <- burned_ft %>%
+#   filter(ft_id == "139871")
+
+# ### intersect
+# burned_ft <- st_intersection(burned_ft, wa_fire)
+
+### plot
+ggplot() +
+    geom_sf(data = ft_1, fill = "lightskyblue3", color = NA) +
+  geom_sf(data = tf1, fill = NA, color = "black", lwd = 2) +
+  theme_void()
+# ggsave("ex_fire_esiil.png")
+
+### open CBI
+cbi_t1 <- raster("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_mtbs_firedpy/CA3312011695319931027.tif")
+
+### reproject
+cbi_t1 <- projectRaster(cbi_t1, crs = 6350,
+                        method = "bilinear") 
+
+### convert to df
+cbi_t1 <- as.data.frame(cbi_t1, xy = TRUE) %>%
+  na.omit() 
+
+### plot
+ggplot() +
+  geom_raster(data = cbi_t1, aes(x = x, y = y, fill = CBI_bc)) +
+  # scale_fill_viridis_c(option = "B") +
+  scale_fill_gradient(low = "#FEF6F2", high = "red3") +
+  geom_sf(data = ft_1, fill = NA, color = "black", lwd = 1) +
+  geom_sf(data = tf1, fill = NA, color = "black", lwd = 2) +
+  theme_void()
+ggsave("C:/Users/kjsie/Documents/scoping/graves_fire_cbi.png")
+```

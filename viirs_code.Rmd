@@ -7,6 +7,8 @@ date: "2023-12-13"
 ## Description
 Gets VIIRS detections from GEE, intersects them with the fire perimeters, then rasterizes them. In the rasterizing process, the value of the pixel is equal to the "day" of the fire: a value of 1 indicates that the pixel burned on the day the fire ignited, while a value of 10 would mean that the pixel burned on the 10th day of the fire.
 
+Note that VIIRS started in 2012, so we don't have VIIRS data for any fires pre-2012
+
 ## Set up
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
