@@ -1,0 +1,1558 @@
+---
+title: "grave_fire"
+output: html_document
+date: "2025-06-12"
+---
+
+## Description
+Picks up after ft_overlaps.Rmd. Develops workflow for assembling covariates using subset of 5 wildfires.
+
+## Set up
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+### Load packages
+library(tidyverse)
+library(sf)
+library(lubridate)
+library(raster)
+library(terra)
+library(stars)
+# library(viridis)
+# library(scales)
+library(lwgeom)
+library(googledrive)
+# library(furrr)
+# library(sfheaders)
+library(units)
+library(stringr)
+library(rmapshaper)
+```
+
+
+## Get sample fires
+```{r}
+### open fire perimeters with fuel reduction treatments
+fires_hfr <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fires_haz_ft.shp")
+
+### Open fuel treatments with >= 900 m2 (one landsat pixel) of forest pre-fire
+burned_ft_forest <- read.csv("burned_fts_forested.csv")
+
+### subset to graves fire
+wa_fire <- fires_hfr %>% filter(Fire_ID == "WA4863311833720150814")
+
+### open fuel treatment polygons
+burned_ft <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/all_burned_fuel_treats_year_updated_polygons_fireID.shp") %>%
+  filter(., ft_id %in% burned_ft_forest$ft_id)
+
+### subset to burned in graves fire
+graves_ft <- burned_ft %>%
+  filter(frst_fr_d == "WA4863311833720150814")
+
+### graves ft as factor
+graves_ft$ft_id <- as.factor(graves_ft$ft_id)
+
+### subset ft
+graves_ft <- graves_ft %>%
+  filter(ft_id %in% c("138363", "139872"))
+
+### snap
+graves_snap <- st_snap(graves_ft, graves_ft, tolerance = 13)
+
+### combine
+graves_unioned <- st_union(graves_snap)
+
+### plot
+ggplot() +
+  geom_sf(data = graves_unioned, fill = NA, color = "blue") +
+  theme_void()
+
+### intersection
+graves_unioned <- st_intersection(graves_unioned, wa_fire)
+
+### plot
+ggplot() +
+  geom_sf(data = graves_unioned, fill = "gray", color = NA) +
+  geom_sf(data = wa_fire, fill = NA, color = "black", lwd = 1) +
+  theme_void()
+ggsave("C:/Users/kjsie/Documents/scoping/graves_fire_diagram.png")
+
+# ### drop geom from object
+# st_geometry(wa_fire) <- NULL
+
+### add column with full file path to the fire names
+sample_fire_wa <- wa_fire %>% 
+  mutate(file_name = paste0("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_fuel_treat_mtbs/", Fire_ID, "_CBI_bc.tif"))
+```
+
+#### cbi map
+```{r}
+### open CBI
+cbi_wa <- raster("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_mtbs_firedpy/WA4863311833720150814.tif")
+
+### reproject
+cbi_wa_rp <- projectRaster(cbi_wa, crs = 6350,
+                           method = "bilinear") 
+
+### convert to df
+cbi_df <- as.data.frame(cbi_wa_rp, xy = TRUE) %>%
+  na.omit() 
+
+### plot
+ggplot() +
+  geom_raster(data = cbi_df, aes(x = x, y = y, fill = CBI_bc)) +
+  # scale_fill_viridis_c(option = "B") +
+  scale_fill_gradient(low = "#FEF6F2", high = "red3") +
+  geom_sf(data = graves_unioned, fill = NA, color = "black", lwd = 1,
+          linetype = 4) +
+  geom_sf(data = wa_fire, fill = NA, color = "black", lwd = 1) +
+  theme_void()
+ggsave("C:/Users/kjsie/Documents/scoping/graves_fire_cbi.png")
+```
+#### target fire
+```{r}
+### all fires
+fires_hfr <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/fires_haz_ft.shp")
+
+### us boundary
+w_us <- st_read("E:/fire_sev_rdd/w_states.shp") %>%
+  st_transform(.,
+               crs = 6350)
+
+### plot
+ggplot() +
+  geom_sf(data = w_us, 
+          fill = NA,
+          color = "black",
+          lw = 0.6) +
+  geom_sf(data = fires_hfr,
+          color = "lightblue",
+          fill = "lightblue") +
+  geom_sf(data = wa_fire,
+          color = "red3",
+          fill = "red3") +
+  theme_void()
+
+### write out
+st_write(wa_fire, "C:/Users/kjsie/Documents/scoping/graves_fire_perim.shp")
+st_write(fires_hfr, "C:/Users/kjsie/Documents/scoping/all_ft_fires_perim.shp")
+```
+
+
+
+
+
+### Sample pts (for MTBS fires)
+```{r, warning=FALSE}
+### make df of fire id, fire year, and year prior
+fire_info <- sample_fire_wa %>%
+  dplyr::select(Fire_ID, Fire_Year) %>%
+  mutate(year_prior = as.numeric(Fire_Year) - 1)
+
+# fire and year_prior for GEE land cover export! And also a uid for the sample pts -- can be based on fire id then nrow
+### get path for fires
+mtbs_path <- list.files(path = "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_fuel_treat_mtbs",
+                        full.names = TRUE)
+
+### restrict mtbs_path to the fires in fires_hfr
+mtbs_path <- mtbs_path[mtbs_path %in% sample_fire_wa$file_name]
+
+### store pts
+store_cbi_pts <- list()
+
+### Loop through files to write out pts
+for (i in 1:length(mtbs_path)) {
+
+  ### print step
+  print(paste0("STEP ", i))
+  
+  ### open file
+  mtbs_i <- raster(mtbs_path[i])
+  
+  ### fire name
+  cbi_fire_name <- mtbs_path[i]
+  cbi_fire_name <- gsub('_CBI_bc.tif','', cbi_fire_name)
+  cbi_fire_name <- gsub('E:/usda_2023/usfs_fuel_treatments/western_us/cbi_fuel_treat_mtbs/',
+                    '', cbi_fire_name)
+
+  ### make points
+  mtbs_pt <- mtbs_i %>%
+    rasterToPoints(spatial = TRUE)
+
+  ### convert to sf
+  mtbs_pt <- st_as_sf(mtbs_pt) %>%
+    
+    ### add fire name
+    mutate(fire_id = cbi_fire_name) %>%
+    
+    ### transform
+    st_transform(6350)
+  
+  ### get fire year and year_prior
+  fire_info_i <- fire_info %>%
+    filter(Fire_ID %in% mtbs_pt$fire_id)
+  
+  ### add this data to sf df
+  mtbs_pt <- mtbs_pt %>%
+    mutate(fire_year = fire_info_i$Fire_Year,
+           year_prior = fire_info_i$year_prior,
+           
+           ### make uid for sample pt
+           row_num = row_number(),
+           uid = paste0(fire_id, "_", row_num))
+  
+  ### drop excess col
+  mtbs_pt <- mtbs_pt %>%
+    dplyr::select(-row_num)
+  
+  ### add to list
+  store_cbi_pts[[i]] <- mtbs_pt
+
+  rm(mtbs_i, mtbs_pt)
+}
+
+### combine sfs
+cbi_full <- do.call(rbind, store_cbi_pts)
+
+rm(store_cbi_pts)
+gc()
+
+## write out
+st_write(cbi_full,
+         "C:/Users/kjsie/Documents/scoping/graves_pts.shp")
+
+```
+## DEM
+Extracted in GEE. Need to convert aspect to SRAI
+Source: USGS 3DEP 10m National Map Seamless (1/3 Arc-Second) https://developers.google.com/earth-engine/datasets/catalog/USGS_3DEP_10m  
+
+### download from Google Drive
+```{r}
+## folder url for google drive
+folder_dem_url <- "https://drive.google.com/drive/u/3/folders/1wALPg_mK3GqqfCuNVMAx7TZBkt17K7Id"
+
+### identify the folder
+folder_dem <- drive_get(as_id(folder_dem_url))
+
+### identify the csvs in that folder
+drive_dem <- drive_ls(folder_dem_url)
+
+### set download path
+dem_path <- "dem/"
+
+### run through files to download
+for (i in seq_along(drive_dem$name)) {
+  drive_download(
+    as_id(drive_dem$id[[i]]),
+    path = file.path(dem_path, drive_dem$name[[i]]),
+    overwrite = TRUE
+  )
+}
+
+```
+
+### Combine and add SRAI
+```{r}
+### get file list
+dem_files <- list.files(path = "dem",
+                        pattern = "*^trial_pts_dem.*\\.csv$",
+                        full.names = TRUE)
+
+### open them all
+dem_all <- lapply(dem_files, read_csv)
+
+### combine
+dem_all <- bind_rows(dem_all)
+
+### drop rows I don't care about
+dem_all <- dem_all %>%
+  dplyr::select(uid, fire_id, fire_year, year_prior,
+                CBI_bc, elevation, slope, aspect)
+
+### convert aspect to SRAI
+dem_all <- dem_all %>%
+  mutate(asp_rad = pi/180 * (aspect-30),
+         aspect_srai_2 = 1 - cos(asp_rad),
+         aspect_srai = aspect_srai_2/2) %>%
+  dplyr::select(-asp_rad,
+                -aspect_srai_2)
+
+### write out
+write_csv(dem_all,
+          "trial_pts_dem.csv")
+```
+
+## Topographic position index (TPI)
+### download from Google Drive
+```{r}
+## folder url for google drive
+folder_tpi_url <- "https://drive.google.com/drive/u/2/folders/1X2axYrr0qZvg7WjvcqbRKCJszpqTlvLJ"
+
+### identify the folder
+folder_tpi <- drive_get(as_id(folder_tpi_url))
+
+### identify the csvs in that folder
+drive_tpi <- drive_ls(folder_tpi_url)
+
+### set download path
+tpi_path <- "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/tpi/"
+
+### run through files to download
+for (i in seq_along(drive_tpi$name)) {
+  drive_download(
+    as_id(drive_tpi$id[[i]]),
+    path = file.path(tpi_path, drive_tpi$name[[i]]),
+    overwrite = TRUE
+  )
+}
+
+```
+
+### combine
+```{r}
+### get file list
+tpi_files <- list.files(path = "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/tpi",
+                        pattern = "*^trial_pts_tpi.*\\.csv$",
+                        full.names = TRUE)
+
+### open them all
+tpi_all <- lapply(tpi_files, read_csv)
+
+### combine
+tpi_all <- bind_rows(tpi_all)
+
+### drop columns I don't care about
+tpi_all <- tpi_all %>%
+  dplyr::select(uid, fire_id, fire_year, year_prior,
+                CBI_bc, tpi = elevation)
+
+### write out
+write_csv(tpi_all,
+          "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/trial_pts_tpi.csv")
+
+### clean up
+rm(tpi_all)
+gc()
+```
+
+
+## Pre-fire land cover (LCMAP)
+### download from Google Drive
+```{r}
+## folder url for google drive
+folder_lcmap_url <- "https://drive.google.com/drive/u/2/folders/1mCNb0hmJRJd15YxnWkxGr3qlyUSxlfqQ"
+
+### identify the folder
+folder_lcmap <- drive_get(as_id(folder_lcmap_url))
+
+### identify the csvs in that folder
+drive_lcmap <- drive_ls(folder_lcmap_url)
+
+### set download path
+lcmap_path <- "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/lcmap/"
+
+### run through files to download
+for (i in seq_along(drive_lcmap$name)) {
+  drive_download(
+    as_id(drive_lcmap$id[[i]]),
+    path = file.path(lcmap_path, drive_lcmap$name[[i]]),
+    overwrite = TRUE
+  )
+}
+
+```
+
+### combine
+1: developed  
+2: cropland  
+3: grass/shrub  
+4: tree cover: tree cover density > 10%  
+5: water  
+6: wetland  
+7: ice/snow  
+8: barren: soil, sand, clearcuts
+```{r}
+### get file list
+lcmap_files <- list.files(path = "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/lcmap",
+                        pattern = "*^trial_pts_lcmap.*\\.csv$",
+                        full.names = TRUE)
+
+### open them all
+lcmap_all <- lapply(lcmap_files, read_csv)
+
+### combine
+lcmap_all <- bind_rows(lcmap_all)
+
+### drop columns I don't care about
+lcmap_all <- lcmap_all %>%
+  dplyr::select(uid, fire_id, fire_year, year_prior,
+                CBI_bc, landcover)
+
+### make landcover df
+landcover_df <- data.frame(landcover = c(1:8),
+                           lc_type = c("developed", "cropland",
+                                       "grass_shrub", "treecover",
+                                       "water", "wetland",
+                                       "ice_snow", "barren"))
+
+### add landcover type 
+lcmap_all <- merge(lcmap_all,
+                   landcover_df,
+                   by = "landcover",
+                   all = TRUE)
+
+
+### write out
+write_csv(lcmap_all,
+          "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/trial_pts_lcmap.csv")
+
+### clean up
+rm(lcmap_all)
+gc()
+```
+
+## Forest type (TreeMap)
+### download from Google Drive
+```{r}
+## folder url for google drive
+folder_treemap_url <- "https://drive.google.com/drive/u/2/folders/1cSrpt85ZEAOru6ROsUGaEI4uThc-pJ7V"
+
+### identify the folder
+folder_treemap <- drive_get(as_id(folder_treemap_url))
+
+### identify the csvs in that folder
+drive_treemap <- drive_ls(folder_treemap_url)
+
+### set download path
+treemap_path <- "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/treemap/"
+
+### run through files to download
+for (i in seq_along(drive_treemap$name)) {
+  drive_download(
+    as_id(drive_treemap$id[[i]]),
+    path = file.path(treemap_path, drive_treemap$name[[i]]),
+    overwrite = TRUE
+  )
+}
+
+```
+
+### combine
+```{r}
+### get file list
+treemap_files <- list.files(path = "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/treemap",
+                        pattern = "*^trial_pts_ftype.*\\.csv$",
+                        full.names = TRUE)
+
+### open them all
+treemap_all <- lapply(treemap_files, read_csv)
+
+### combine
+treemap_all <- bind_rows(treemap_all)
+
+### drop columns I don't care about
+treemap_all <- treemap_all %>%
+  dplyr::select(uid, fire_id, fire_year, year_prior,
+                CBI_bc, forest_type = FORTYPCD)
+
+### add column for higher level forest types
+treemap_all <- treemap_all %>%
+  mutate(forest_type_gen = ifelse(forest_type < 120, "white/red/jack pine", ifelse((forest_type > 110 & forest_type < 140), "spruce/fire", ifelse((forest_type > 139 & forest_type < 150), "longleaf/slash pine", ifelse((forest_type > 150 & forest_type < 152), "tropical softwood", ifelse((forest_type > 159 & forest_type < 170), "loblolly/shortleaf pine", ifelse((forest_type > 169 & forest_type < 180), "other eastern softwoods", ifelse((forest_type > 179 & forest_type < 199), "pinyon/juniper", ifelse((forest_type > 199 & forest_type < 220), "douglas-fir", ifelse((forest_type > 219 & forest_type < 239), "ponderosa pine", ifelse((forest_type > 239 & forest_type < 260), "western white pine", ifelse((forest_type > 259 & forest_type < 280), "fir/spruce/mountain hemlock", ifelse((forest_type > 279 & forest_type < 299), "lodgepole pine", ifelse((forest_type > 299 & forest_type < 320), "hemlock/sitka spruce", ifelse((forest_type > 319 & forest_type < 339), "western larch", ifelse((forest_type > 339 & forest_type < 360), "redwood", ifelse((forest_type > 359 & forest_type < 370), "other western softwoods", ifelse((forest_type > 369.5 & forest_type < 380), "california mixed conifer", ifelse((forest_type > 379 & forest_type < 389), "exotic softwoods", ifelse((forest_type > 389 & forest_type < 400), "other softwoods", ifelse((forest_type > 399 & forest_type < 499), "oak/pine", ifelse((forest_type > 499 & forest_type < 599), "oak/hickory", ifelse((forest_type > 599 & forest_type < 699), "oak/gum/cypress", ifelse((forest_type > 699 & forest_type < 799), "elm/ash/cottonwood", ifelse((forest_type > 799 & forest_type < 899), "maple/beech/birch", ifelse((forest_type > 899 & forest_type < 909), "aspen/birch", ifelse((forest_type > 909 & forest_type < 919), "alder/maple", ifelse((forest_type > 919 & forest_type < 939), "western oak", ifelse((forest_type > 939 & forest_type < 959), "tanoak/laurel", ifelse((forest_type > 959 & forest_type < 969), "other hardwoods", ifelse((forest_type > 969 & forest_type < 979), "woodland hardwoods", ifelse((forest_type > 979 & forest_type < 989), "tropical hardwoods", ifelse((forest_type > 989 & forest_type < 996), "exotic hardwoods", ifelse(forest_type > 989, "nonstocked", "other"))))))))))))))))))))))))))))))))))
+
+### write out
+write_csv(treemap_all,
+          "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/trial_pts_treemap.csv")
+
+### clean up
+rm(treemap_all)
+gc()
+```
+
+
+
+## VIIRS
+See viirs_code.Rmd for details on processing VIIRS to rasters, as well as missing fires
+
+### extract date burned from VIIRS
+```{r}
+### get path for VIIRS rasters
+viirs_file_path <- "E:/usda_2023/usfs_fuel_treatments/western_us/viirs_rast_date"
+
+### list viirs files
+viirs_files <- list.files(path = viirs_file_path,
+                        full.names = TRUE)
+
+### make df to use based on cbi_full
+viirs_dat <- cbi_full %>%
+  dplyr::select(uid, fire_id, fire_year) %>%
+  mutate(viirs_file = paste0(viirs_file_path, "/", fire_id, ".tif"))
+
+# ### subset viirs files
+# viirs_files_5 <- viirs_files[viirs_files %in% viirs_dat]
+
+### open rasters for the viirs fires I care about
+### restrict to fires post-VIIRS deployment (so can't look at CA3312011695319931027.tif)
+# r1 <- raster("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_rast_date/CA3312011695319931027.tif")
+r2 <- raster("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_rast_date/CA3779911892220160804.tif")
+r3 <- raster("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_rast_date/ID4485611430720180802.tif")
+r4 <- raster("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_rast_date/NM3288810780920130607.tif")
+r5 <- raster("E:/usda_2023/usfs_fuel_treatments/western_us/viirs_rast_date/OR4428411896120150812.tif")
+
+### extract raster values to df
+viirs_dat$day_of_fire2 <- extract(r2, viirs_dat)
+viirs_dat$day_of_fire3 <- extract(r3, viirs_dat)
+viirs_dat$day_of_fire4 <- extract(r4, viirs_dat)
+viirs_dat$day_of_fire5 <- extract(r5, viirs_dat)
+
+### simplify
+viirs_dat <- viirs_dat %>%
+  mutate(day_of_fire = ifelse(fire_id == "CA3779911892220160804",
+                              day_of_fire2,
+                              ifelse(fire_id == "ID4485611430720180802",
+                                     day_of_fire3,
+                                     ifelse(fire_id == "NM3288810780920130607",
+                                            day_of_fire4,
+                                            ifelse(fire_id == "OR4428411896120150812",
+                                                   day_of_fire5,
+                                                   NA)))))
+### drop old cols
+viirs_dat <- viirs_dat %>%
+  dplyr::select(-day_of_fire3, -day_of_fire4, -day_of_fire5, -day_of_fire2)
+
+### get fire start date
+mt <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/mtbs_west.shp") %>%
+  filter(., Event_ID %in% viirs_dat$fire_id) %>%
+  dplyr::select(., fire_id = Event_ID,
+                Ig_Date)
+st_geometry(mt) <- NULL
+
+### merge in
+viirs_dat <- merge(viirs_dat,
+                   mt,
+                   by = "fire_id")
+
+### calculate date each point burned
+viirs_dat <- viirs_dat %>%
+  mutate(date_burned = Ig_Date + day_of_fire)
+
+### date_burned is the date for which I want the fire weather extracted!
+viirs_dat_simp <- viirs_dat %>%
+  dplyr::select(uid, fire_year, Ig_Date, date_burned, geometry)
+
+### write out
+st_write(viirs_dat_simp,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/viirs_for_gee.shp")
+rm(r2, r3, r4, r5)
+
+### write out version without 1993 fire
+viirs_dat_simp <- viirs_dat_simp %>% filter(fire_yr > 2000)
+st_write(viirs_dat_simp, "E:/usda_2023/usfs_fuel_treatments/western_us/viirs_fires_for_gee.shp")
+```
+
+## Climate data
+Data extract from TerraClimate and gridMET using GEE
+
+### notes from Steve's readme
+allclimatedata.csv contains a row for each provided sample points (rows), and columns for weather data from terraclimate and gridmet
+
+Columns:
+- uid: the unique point id from the original provided sample points
+- XXXX_lag_Y: terraclimate variable XXXX at month lag Y, based on the burn date for the sample point. 
+lag 0 is the month containing the burn date in the original sample point asset, lag 11 is 11 months prior (so we have 12 months total).
+- remaining columns are the requested bands from gridmet on the burn date for the sample point.
+
+Note on units:
+Values are extracted directly from the Earth Engine assets and are not transformed to be in comparable units across data sources. 
+Given that the units are different, these will need to be transformed before use/comparison. For example, terraclimate has temperatures
+in units of 0.1 degrees C (e.g., a value of 254 is 25.4C), while gridmet has temps in deg K.
+
+Links to info on band units
+- https://developers.google.com/earth-engine/datasets/catalog/IDAHO_EPSCOR_TERRACLIMATE#bands
+- https://developers.google.com/earth-engine/datasets/catalog/IDAHO_EPSCOR_GRIDMET#bands
+
+Note on invalid sample points in original asset: some of the sample points in the original asset file (25,755) appeared to have a null burn date
+and so were dropped, as the absence of a burn date precluded proper selection of weather assets.
+
+```{r}
+### open GEE data
+clim_dat <- read.csv("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/allclimatedata.csv")
+```
+
+
+## Creating boundaries between treated and untreated
+
+### try for one of the fires
+#### prep treatment polygons
+```{r}
+### open df of mtbs fires
+mt <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/mtbs_west.shp")
+
+### subset to one of the test fires
+test_fire <- mt %>%
+  filter(Event_ID == "CA3779911892220160804")
+
+### clean up
+rm(mt)
+gc()
+
+### fts that burned
+burned_ft <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/all_burned_fuel_treats_year_updated_polygons_fireID.shp") %>%
+  rename(., STATE_ABBR = STATE_A,
+         activity_code = ACTIVITY_,
+         activity = ACTIVITY,
+         treatment = TREATMENT_,
+         DATE_COMP = DATE_CO,
+         date_comp = dat_cmp,
+         month_comp = mnth_cm,
+         year_comp = yer_cmp,
+         first_fire_id = frst_fr_d,
+         first_fire_source = frst_fr_s,
+         fire_ig_date = fr_g_dt)
+
+### classify treatment types
+rx_fuel_treat <- c("1111", "1112", "1113", "2540")
+other_fire_fuel_treat <- "1130"
+mech_fuel_treat <- c("1136", "1139", "1150", "1152", "1153", 
+                     "1154", "1160", "1180", "2370", "4455")
+rx_non_ft <- c("4471", "4491", "4541", "6101", "7050")
+other_fire_non_ft <- "1102"
+mech_non_ft <- c("1120", "2341", "2360", "2510", "2530", "4111", 
+                 "4113", "4115", "4117", "4121", "4131", "4132", 
+                 "4142", "4143", "4146", "4151", "4152", "4177", 
+                 "4183", "4193", "4194", "4210", "4211", "4220", 
+                 "4231", "4232", "4241", "4242", "4270", "4471", 
+                 "4473", "4474", "4475", "4493", "4494", "4495", 
+                 "4511", "4521", "4530", "4540", "6103", '6107', 
+                 "7065", "7067", "9008", "9400", "4472")
+
+### add column for overall treatment type
+burned_ft <- burned_ft %>%
+  mutate(overall_treat_type = ifelse(activity_code %in% mech_non_ft,
+                                     "mech_non_ft",
+                                     ifelse(activity_code %in% other_fire_non_ft,
+                                            "other_fire_non_ft",
+                                            ifelse(activity_code %in% rx_non_ft,
+                                                   "rx_non_ft",
+                                                   ifelse(activity_code %in% mech_fuel_treat,
+                                                          "mech_fuel_treat",
+                                                          ifelse(activity_code %in% other_fire_fuel_treat,
+                                                                 "other_fire_fuel_treat",
+                                                                 ifelse(activity_code %in% rx_fuel_treat,
+                                                                        "rx_fuel_treat",
+                                                                        "other")))))))
+
+### remove Planned Treatment Burned in Wildfire, Wildfire - Human Ignition, and Wildfire - Natural Ignition 
+burned_ft <- burned_ft %>%
+  filter(!activity_code %in% c("1119", "1117", "1118"))
+
+### treated for fuel vs not treated for fuel
+burned_ft <- burned_ft %>%
+  mutate(treat_for_fuel = ifelse(overall_treat_type %in% c("mech_fuel_treat",
+                                                           "other_fire_fuel_treat",
+                                                           "rx_fuel_treat",
+                                                           "other_fire_non_ft"),
+                                 "treat_for_fuel",
+                                 "non_fuel_treat"))
+
+### also make it numeric
+burned_ft <- burned_ft %>%
+  mutate(tff_num = ifelse(treat_for_fuel == "treat_for_fuel", 1, 0))
+
+### restrict to that fire
+test_ft <- burned_ft %>%
+  filter(first_fire_id == "CA3779911892220160804")
+
+### clean up
+rm(burned_ft)
+gc()
+
+### make individual polygons
+test_ft <- test_ft %>%
+  st_cast("POLYGON")
+
+### add row number within each 
+test_ft <- test_ft %>%
+  group_by(ft_id) %>%
+  mutate(rowid = row_number())
+
+### make unique id
+test_ft <- test_ft %>%
+  mutate(u_ft_id = paste0(ft_id, "_", rowid))
+
+### for the purposes of the boundaries, remove fts that were non_fuel_treat
+test_ft_ft <- test_ft %>%
+  filter(treat_for_fuel == "treat_for_fuel")
+
+# ### try union
+# test_union <- test_ft_ft %>%
+#   st_snap_to_grid(size = 0.001) %>%
+#   st_make_valid() %>%
+#   st_union()
+
+### try something hacky using rmapshaper
+test_diss <- test_ft_ft %>%
+  ms_dissolve() %>%
+  ms_explode() %>%
+  mutate(geom_char = as.character(geometry)) %>%
+  dplyr::select(-rmapshaperid) %>%
+  distinct() %>%
+  mutate(poly_id = row_number()) %>%
+  dplyr::select(-geom_char)
+
+# ggplot() + geom_sf(data = test_union)
+ggplot() + geom_sf(data = test_diss, aes(color = as.factor(poly_id)))
+
+# ### separate
+# test_un_cast <- test_union %>%
+#   st_cast()
+
+# ### exact overlaps?
+# exact_overlap <- as.data.frame(st_equals(test_ft, sparse = FALSE))
+# 
+# ### add column names
+# column_names <- unique(test_ft$ft_id)
+# colnames(exact_overlap) <- column_names
+# rownames(exact_overlap) <- column_names
+# 
+# ### try using self-join
+# overlap_df <- st_join(test_ft,
+#                       test_ft,
+#                       join = st_equals)
+```
+
+#### create border for one ft
+#### How to do it
+- for fts that are completely surrounded by the fire, use st_contains to identify them, then need to use those polygons for the distance calculations
+- for fts that are on the border, need to get the part of the ft that is within the fire (st_intersection) and the part of the fire that is not within the ft (rmapshaper::ms_erase), then combine into single df and then get inner line
+
+GOAL: list with polygons that are contained and inner lines for polygons that aren't contained
+loop through and use if?
+```{r}
+### get one of the polygons from test_diss
+use_ft <- test_diss %>%
+  filter(poly_id == "7")
+
+### visualize
+ggplot() +
+  geom_sf(data = test_fire, color = "gray32", fill = "pink") +
+  geom_sf(data = use_ft, color = "gray32", fill = "lightgreen")
+
+### get fire without the ft
+no_intersect <- rmapshaper::ms_erase(test_fire, use_ft)
+
+### get just the part of use_ft that's inside the fire
+use_ft_crop <- st_intersection(use_ft, test_fire)
+# ggplot() + 
+#   geom_sf(data = use_ft, color = "red", fill = "red") +
+#   geom_sf(data = use_ft_crop, color = "black", fill = "black")
+
+### visualize
+ggplot() +
+  geom_sf(data = test_fire, color = "pink", fill = "pink") +
+  geom_sf(data = use_ft_crop, color = "red", fill = "lightgreen") +
+  geom_sf(data = no_intersect, color = "black", fill = NA)
+
+### give them the same column names
+no_intersect <- no_intersect %>%
+  dplyr::select(Event_ID, geometry)
+use_ft_crop <- use_ft_crop %>%
+  dplyr::select(Event_ID = poly_id, geometry)
+
+### combine 
+comb_sf <- rbind(no_intersect, use_ft_crop)
+# st_write(comb_sf, "comb_test_sf.shp")
+
+# ggplot() +
+#   geom_sf(data = comb_sf, aes(fill = Event_ID))
+
+### try making inner line
+bound_test <- comb_sf %>%
+  ms_innerlines() %>%
+  as_tibble() %>%
+  st_as_sf()
+
+ggplot() +
+  geom_sf(data = comb_sf, aes(fill = Event_ID, color = Event_ID)) +
+  geom_sf(data = bound_test)
+
+### polygons that are completely within fire perim -- st_contains()
+```
+
+#### This code makes the boundaries for all fuel treatments in a single fire
+```{r}
+### fts = test_diss
+### fire = test_fire
+
+### make output
+boundary_polys <- list()
+
+### write loop
+for (i in 1:nrow(test_diss)) {
+  
+  ### get polygon_i
+  polygon_i <- test_diss[i, ]
+  
+  ### get whether it's contained
+  contained <- st_within(polygon_i, test_fire, sparse = FALSE)
+  
+  ### check if any values are false
+  if (!FALSE %in% contained) {
+    
+    ### change column names to match the output of the second half of the loop
+    polygon_i <- polygon_i %>%
+      dplyr::select(geometry)
+    
+    ### add to output list
+    boundary_polys[[i]] <- polygon_i
+    
+  } else {
+    
+    ### get the fire without the ft
+    no_intersect_i <- rmapshaper::ms_erase(test_fire, test_diss[i, ])
+    
+    ### get just the part of use_ft that's inside the fire
+    use_ft_crop_i <- st_intersection(test_diss[i, ], test_fire)
+    
+    ### give them the same column names
+    no_intersect_i <- no_intersect_i %>%
+      dplyr::select(Event_ID, geometry)
+    use_ft_crop_i <- use_ft_crop_i %>%
+      dplyr::select(Event_ID = poly_id, geometry)
+    
+    ### combine them
+    comb_sf <- rbind(no_intersect_i,
+                     use_ft_crop_i)
+    
+    ### make inner line
+    inner_line <- comb_sf %>%
+      ms_innerlines() %>%
+      as_tibble() %>%
+      st_as_sf()
+    
+    ### add the inner line to the result
+    
+    ### make sure there's a value
+    if (!is_empty(inner_line)) {  
+      
+      ### add it to the output list
+      boundary_polys[[i]] <- inner_line
+      
+    }
+  }
+}   
+
+### combine list
+result <- do.call(rbind, boundary_polys)
+
+### visualize
+ggplot() +
+  geom_sf(data = test_fire) +
+  # geom_sf(data = test_diss, aes(color = as.factor(poly_id))) +
+  geom_sf(data = result, color = "red") +
+  NULL
+```
+### run through for all subsample fires
+#### prep treatment polygons
+```{r}
+### open df of mtbs fires
+mt <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/mtbs_west.shp") %>%
+  filter(., Event_ID %in% c("CA3312011695319931027",
+                            "CA3779911892220160804",
+                            "ID4485611430720180802",
+                            "NM3288810780920130607",
+                            "OR4428411896120150812"))
+# st_write(mt, "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/sample_fires.shp")
+
+### fts that burned
+burned_ft <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/all_burned_fuel_treats_year_updated_polygons_fireID.shp") %>%
+  rename(., STATE_ABBR = STATE_A,
+         activity_code = ACTIVITY_,
+         activity = ACTIVITY,
+         treatment = TREATMENT_,
+         DATE_COMP = DATE_CO,
+         date_comp = dat_cmp,
+         month_comp = mnth_cm,
+         year_comp = yer_cmp,
+         first_fire_id = frst_fr_d,
+         first_fire_source = frst_fr_s,
+         fire_ig_date = fr_g_dt)
+
+### classify treatment types
+rx_fuel_treat <- c("1111", "1112", "1113", "2540")
+other_fire_fuel_treat <- "1130"
+mech_fuel_treat <- c("1136", "1139", "1150", "1152", "1153", 
+                     "1154", "1160", "1180", "2370", "4455")
+rx_non_ft <- c("4471", "4491", "4541", "6101", "7050")
+other_fire_non_ft <- "1102"
+mech_non_ft <- c("1120", "2341", "2360", "2510", "2530", "4111", 
+                 "4113", "4115", "4117", "4121", "4131", "4132", 
+                 "4142", "4143", "4146", "4151", "4152", "4177", 
+                 "4183", "4193", "4194", "4210", "4211", "4220", 
+                 "4231", "4232", "4241", "4242", "4270", "4471", 
+                 "4473", "4474", "4475", "4493", "4494", "4495", 
+                 "4511", "4521", "4530", "4540", "6103", '6107', 
+                 "7065", "7067", "9008", "9400", "4472")
+
+### add column for overall treatment type
+burned_ft <- burned_ft %>%
+  mutate(overall_treat_type = ifelse(activity_code %in% mech_non_ft,
+                                     "mech_non_ft",
+                                     ifelse(activity_code %in% other_fire_non_ft,
+                                            "other_fire_non_ft",
+                                            ifelse(activity_code %in% rx_non_ft,
+                                                   "rx_non_ft",
+                                                   ifelse(activity_code %in% mech_fuel_treat,
+                                                          "mech_fuel_treat",
+                                                          ifelse(activity_code %in% other_fire_fuel_treat,
+                                                                 "other_fire_fuel_treat",
+                                                                 ifelse(activity_code %in% rx_fuel_treat,
+                                                                        "rx_fuel_treat",
+                                                                        "other")))))))
+
+### remove Planned Treatment Burned in Wildfire, Wildfire - Human Ignition, and Wildfire - Natural Ignition 
+burned_ft <- burned_ft %>%
+  filter(!activity_code %in% c("1119", "1117", "1118"))
+
+### treated for fuel vs not treated for fuel
+burned_ft <- burned_ft %>%
+  mutate(treat_for_fuel = ifelse(overall_treat_type %in% c("mech_fuel_treat",
+                                                           "other_fire_fuel_treat",
+                                                           "rx_fuel_treat",
+                                                           "other_fire_non_ft"),
+                                 "treat_for_fuel",
+                                 "non_fuel_treat"))
+
+### also make it numeric
+burned_ft <- burned_ft %>%
+  mutate(tff_num = ifelse(treat_for_fuel == "treat_for_fuel", 1, 0))
+
+### restrict to the sample fires
+burned_ft <- burned_ft %>%
+  filter(first_fire_id %in% mt$Event_ID)
+
+### make individual polygons
+burned_ft <- burned_ft %>%
+  st_cast("POLYGON")
+
+### add row number within each 
+burned_ft <- burned_ft %>%
+  group_by(ft_id) %>%
+  mutate(rowid = row_number())
+
+### make unique id
+burned_ft <- burned_ft %>%
+  mutate(u_ft_id = paste0(ft_id, "_", rowid))
+
+### for the purposes of the boundaries, remove fts that were non_fuel_treat
+test_ft <- burned_ft %>%
+  filter(treat_for_fuel == "treat_for_fuel")
+
+# ### try union
+# test_union <- test_ft_ft %>%
+#   st_snap_to_grid(size = 0.001) %>%
+#   st_make_valid() %>%
+#   st_union()
+
+### make valid
+test_ft <- test_ft %>%
+  st_make_valid()
+
+# st_write(test_ft, "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/sample_fire_fts.shp")
+```
+
+#### loop through to make boundaries for each fire
+```{r}
+### output spot
+bound_polys <- list()
+
+### loop through fires
+for (i in 1:nrow(mt)) {
+  
+  ### get fire
+  fire_i <- mt[i, ]
+  
+  ### get the fts for that fire
+  ft_i <- test_ft %>%
+    filter(first_fire_id %in% fire_i$Event_ID)
+  
+  ### deal with overlapping fts
+  diss_i <- ft_i %>%
+    ms_dissolve() %>%
+    ms_explode() %>%
+    st_make_valid() %>%
+    mutate(geom_char = as.character(geometry)) %>%
+    dplyr::select(-rmapshaperid) %>%
+    distinct() %>%
+    mutate(poly_id = row_number()) %>%
+    dplyr::select(-geom_char) %>%
+    mutate(fire_id = fire_i$Event_ID)
+  
+  # ### check what this looks like
+  # st_write(diss_i,
+  #          "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/ft_dissolved.shp")
+  
+  ### now loop through fuel treatments in the fire
+  
+  ### make an output list for each time i go through i loop
+  inner_list <- list()
+  
+  ### make loop for fts
+  for (j in 1:nrow(diss_i)) {
+    
+    ### get polygon_j
+    polygon_j <- diss_i[j, ]
+    
+    ### figure out whether it's contained in the fire
+    contained <- st_within(polygon_j, fire_i, sparse = FALSE)
+    
+    ### check if any values are false
+    if (!FALSE %in% contained) {
+      
+      ### change column names to match the output of the second half of the loop
+      polygon_j <- polygon_j %>%
+        dplyr::select(fire_id,
+                      geometry)
+      
+      ### add to output list
+      inner_list[[j]] <- polygon_j
+      
+    } else {
+      
+      ### get the fire without the ft
+      no_intersect_i <- rmapshaper::ms_erase(fire_i, polygon_j)
+      
+      ### get just the part of use_ft that's inside the fire
+      use_ft_crop_i <- st_intersection(polygon_j, fire_i)
+      
+      ### give them the same column names
+      no_intersect_i <- no_intersect_i %>%
+        dplyr::select(Event_ID, geometry)
+      use_ft_crop_i <- use_ft_crop_i %>%
+        dplyr::select(Event_ID, geometry)
+      
+      ### combine them
+      comb_sf <- rbind(no_intersect_i,
+                       use_ft_crop_i)
+      # ### check what this looks like
+      # st_write(comb_sf,
+      #          "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/ft_fire_comb.shp")
+      
+      ### make inner line
+      inner_line <- comb_sf %>%
+        ms_innerlines() %>%
+        as_tibble() %>%
+        st_as_sf() %>%
+        mutate(fire_id = no_intersect_i$Event_ID) %>%
+        dplyr::select(fire_id, geometry)
+      # ### check what this looks like
+      # st_write(inner_line,
+      #          "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/inner_line_test.shp")
+      
+      
+      ### add the inner line to the result
+      
+      ### make sure there's a value
+      if (!is_empty(inner_line)) {  
+        
+        ### add it to the output list
+        inner_list[[j]] <- inner_line
+        
+      }
+    }
+    
+    ### unlist inner_list
+    inner_df <- do.call(rbind, inner_list)
+    
+    ### add inner_list to bound_polys
+    bound_polys[[i]] <- inner_df
+  }
+}
+
+### unlist
+bound_polys_all <- do.call(rbind, bound_polys)
+st_write(bound_polys_all,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/all_ft_boundaries.shp")
+
+
+# ### visualize
+# ggplot() +
+#   geom_sf(data = test_fire) +
+  # geom_sf(data = test_diss, aes(color = as.factor(poly_id))) +
+  # geom_sf(data = result, color = "red") +
+  # NULL
+```
+
+## Distance to boundary
+### try on subset of points
+```{r}
+### open sample points
+pts <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/cbi_pts_mtbs.shp")
+
+### add poly id to bound_polys_all
+bound_polys_all <- bound_polys_all %>%
+  mutate(poly_id = row_number())
+
+### try for a random subset of the points
+pts_samp <- pts[sample(nrow(pts), 300), ]
+
+### get nearest feature
+nearest_poly <- st_nearest_feature(pts_samp, bound_polys_all)
+
+### add to pts_samp
+pts_samp <- pts_samp %>%
+  mutate(nearest_poly = nearest_poly)
+
+### make output df
+dist_df <- data.frame(matrix(ncol = 2, nrow = 0))
+column_names <- c("uid", "dist_bound")
+colnames(dist_df) <- column_names
+
+### for loop
+for (i in 1:nrow(pts_samp)) {
+  
+  ### get pt
+  pt_i <- pts_samp[i, ]
+  
+  ### get nearest poly_id
+  poly_i <- bound_polys_all %>%
+    filter(poly_id %in% pt_i$nearest_poly)
+  
+  ### calculate distance
+  dist_i <- st_distance(pt_i, poly_i)
+  
+  ### make it a df
+  df_i <- as.data.frame(cbind(uid = pt_i$uid,
+                              dist_bound = dist_i))
+  
+  ### rename columns
+  colnames(df_i) <- c("uid", "dist_bound")
+  
+  ### add to df
+  dist_df <- rbind(dist_df,
+                   df_i)
+  
+}
+
+### merge into sf df
+pts_samp <- merge(pts_samp,
+                  dist_df,
+                  by = "uid")
+
+### test it with qgis
+st_write(pts_samp,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/check_dist.shp")
+
+```
+
+### all points
+```{r}
+### open boundaries
+bound_polys_all <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/all_ft_boundaries.shp")
+
+### open sample points
+pts <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/cbi_pts_mtbs.shp")
+
+### add poly id to bound_polys_all
+bound_polys_all <- bound_polys_all %>%
+  mutate(poly_id = row_number())
+
+### get nearest feature
+nearest_poly <- st_nearest_feature(pts, bound_polys_all)
+
+### add to pts
+pts <- pts %>%
+  mutate(nearest_poly = nearest_poly)
+
+### clean up
+rm(nearest_poly)
+gc()
+
+# ### make output df
+# dist_df <- data.frame(matrix(ncol = 2, nrow = 0))
+# column_names <- c("uid", "dist_bound")
+# colnames(dist_df) <- column_names
+
+### make output list
+dist_list <- list()
+
+### for loop
+for (i in 1:nrow(pts)) {
+  
+  ### get pt
+  pt_i <- pts[i, ]
+  
+  ### get nearest poly_id
+  poly_i <- bound_polys_all %>%
+    filter(poly_id %in% pt_i$nearest_poly)
+  
+  ### calculate distance
+  dist_i <- st_distance(pt_i, poly_i)
+  
+  ### make it a df
+  df_i <- as.data.frame(cbind(uid = pt_i$uid,
+                              dist_bound = dist_i))
+  
+  ### rename columns
+  colnames(df_i) <- c("uid", "dist_bound")
+  
+  ### add to list
+  dist_list[[i]] <- df_i
+  
+  # ### add to df
+  # dist_df <- rbind(dist_df,
+  #                  df_i)
+  
+}
+
+### unlist
+dist_df <- do.call(rbind, dist_list)
+
+### clean up
+rm(dist_list)
+gc()
+
+### merge into sf df
+pts <- merge(pts,
+             dist_df,
+             by = "uid",
+             all = TRUE)
+
+### drop geom
+st_geometry(pts) <- NULL
+
+### test it with qgis
+write_csv(pts,
+         "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/pts_dist.csv")
+```
+## Points on ft boundaries
+Don't want to include points whose pixels straddle the boundaries
+```{r}
+### open distance from pts to nearest boundary file
+dist_bound <- read_csv("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/pts_dist.csv")
+
+### subset to pts that are close to the nearest boundary, as these are the points likely to be on the boundary. Since each pixel is 30 x 30, the furthest a point could be from the boundary and still be inside the pixel that's crossed by the boundary is sqrt(1800). Use a slightly bigger number just for wiggle room
+dist_bound <- dist_bound %>%
+  filter(dist_bound < 60)
+
+### open pts shp and restrict to pts close to boundary
+pts <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/cbi_pts_mtbs.shp") %>%
+  filter(.,
+         uid %in% dist_bound$uid)
+
+### convert pts to squares
+pts <- pts %>%
+  st_buffer(dist = 15,
+            endCapStyle = "SQUARE")
+
+### open boundaries
+bound_polys_all <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/all_ft_boundaries.shp") %>%
+  mutate(., poly_id = row_number())
+
+### check for overlaps
+overlap_pts <- st_intersection(pts, bound_polys_all)
+
+### drop geom
+st_geometry(overlap_pts) <- NULL
+
+### column for overlap
+overlap_pts <- overlap_pts %>%
+  mutate(overlap_bound = "overlap") %>%
+  dplyr::select(uid, overlap_bound) %>%
+  distinct()
+
+### open full pts shp 
+pts <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/cbi_pts_mtbs.shp") 
+
+### drop geom
+st_geometry(pts) <- NULL
+
+### merge
+pts <- merge(x = pts,
+             y = overlap_pts,
+             by = "uid",
+             all.x = TRUE)
+
+### change NAs
+pts$overlap_bound[is.na(pts$overlap_bound)] <- "nonoverlap"
+
+### write out
+write_csv(pts,
+          "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/pts_overlap_status.csv")
+
+# check <- bound_polys_all %>% filter(poly_id %in% c(14, 15, 16))
+# check_pts <- pts %>% filter(uid == "ID4485611430720180802_212424")
+# ggplot() + geom_sf(data = check) + geom_sf(data = check_pts, color = "red", fill = NA)
+```
+
+## Points on fire boundaries
+Don't want to include points whose pixels straddle the fire boundary
+```{r}
+### open pts shp and restrict to pts close to boundary
+pts <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/cbi_pts_mtbs.shp") 
+
+### convert pts to squares
+pts <- pts %>%
+  st_buffer(dist = 15,
+            endCapStyle = "SQUARE")
+
+### get fire start date
+mt <- st_read("E:/usda_2023/usfs_fuel_treatments/western_us/mtbs_west.shp") %>%
+  filter(., Event_ID %in% pts$fire_id)
+
+### output
+outer_bound <- list()
+
+### loop
+for (i in 1:nrow(mt)) {
+  
+  ### get fire
+  temp_fire <- mt[i, ]
+  
+  ### get pts
+  temp_pts <- pts %>%
+    filter(fire_id %in% temp_fire)
+  
+  ### get overlap
+  temp_over <- st_intersection(temp_pts, temp_fire)
+  
+  ### store
+  outer_bound[[i]] <- temp_over
+  
+  ### clean 
+  rm(temp_pts, temp_over)
+  gc()
+  
+}
+
+### combine
+outer_bound_pts <- do.call(rbind, outer_bound)
+
+### calculate area
+outer_bound_pts$pix_area <- st_area(outer_bound_pts)
+
+### drop pts whose pixels are not fully contained
+full_pix <- outer_bound_pts %>%
+  mutate(pix_area = drop_units(pix_area)) %>%
+  filter(pix_area > 899.999999999)
+
+### drop geom
+st_geometry(full_pix) <- NULL
+
+### clean
+rm(outer_bound, outer_bound_pts)
+gc()
+
+### simplify full_pix for merge
+full_pix <- full_pix %>%
+  dplyr::select(uid, pix_area) %>%
+  mutate(in_fire = "inside")
+
+### merge with full pts
+pts <- merge(x = pts,
+             y = full_pix,
+             by = "uid",
+             all.x = TRUE)
+
+### change NAs
+pts$in_fire[is.na(pts$in_fire)] <- "not_inside"
+
+### simplify
+st_geometry(pts) <- NULL
+pts <- pts %>%
+  dplyr::select(uid, in_fire)
+
+### write out
+write_csv(pts,
+          "E:/usda_2023/usfs_fuel_treatments/western_us/cbi_pts_trial/pts_within_fire_status.csv")
+
+# check <- bound_polys_all %>% filter(poly_id %in% c(14, 15, 16))
+# check_pts <- pts %>% filter(uid == "ID4485611430720180802_212424")
+# ggplot() + geom_sf(data = check) + geom_sf(data = check_pts, color = "red", fill = NA)
+```
+
+
+
+
+## OLD CODE
+### rmapshaper demo
+Notes from rmapshaper conversation:
+"It appears that the boundaries between polygons are not quite close enough to be detected as "shared". I haven't implemented ms_snap() to snap boundaries together, but you can use ms_simplify() to do it - set the keep = 1 to keep all vertices (i.e., apply no simplification), but play with the snap_interval parameter to get the appropriate amount of shared boundary snapping. e.g.:
+```{r}
+library(sf)
+#> Linking to GEOS 3.11.0, GDAL 3.5.3, PROJ 9.1.0; sf_use_s2() is TRUE
+library(rmapshaper)
+
+poly <- st_read("https://raw.githubusercontent.com/katherinesiegel/ms_innerlines/master/test_github.geojson", 
+                quiet = TRUE)
+
+ms_simplify(poly, keep = 1, snap_interval = 10) %>% 
+ms_innerlines() %>% 
+  plot()
+```
+
+
+
+```{r}
+### set vertices
+polygon_vertices <- matrix(c(-1489008, 1369848,
+                             -1488191, 1370128,
+                             -1488132, 1369347,
+                             -1488985, 1369243,
+                             -1489008, 1369848),
+                           ncol = 2,
+                           byrow = TRUE) 
+
+### make it a polygon
+polygon_extent <- st_polygon(list(polygon_vertices))
+
+### make it an sf object and set the crs
+polygon_extent <- polygon_extent %>%
+  st_sfc(crs = 6350)
+
+### set the vertices for the rows of the sf df
+p1_vertices <- matrix(c(-1488355, 1369737,  
+                        -1488355, 1370072,  
+                        -1488237, 1370112, 
+                        -1488190, 1370112,
+                        -1488162, 1369737,
+                        -1488355, 1369737),
+                      ncol = 2, byrow = TRUE)
+p2_vertices <- matrix(c(-1488355, 1369737,  
+                        -1488355, 1370072,  
+                        -1488237, 1370112, 
+                        -1488190, 1370112,
+                        -1488162, 1369737,
+                        -1488355, 1369737),
+                      ncol = 2, byrow = TRUE)
+p3_vertices <- matrix(c(-1488253, 1369484,  
+                        -1488253, 1369859,  
+                        -1488171, 1369859, 
+                        -1488143, 1369484,
+                        -1488253, 1369484),
+                      ncol = 2, byrow = TRUE) 
+p4_vertices <- matrix(c(-1488292, 1369795,  
+                        -1488292, 1370093,  
+                        -1488191, 1370128, 
+                        -1488166, 1369795,
+                        -1488292, 1369795),
+                      ncol = 2, byrow = TRUE) 
+p5_vertices <- matrix(c(-1488260, 1369634,  
+                        -1488154, 1369634,  
+                        -1488132, 1369347, 
+                        -1488260, 1369332,
+                        -1488260, 1369634),
+                      ncol = 2, byrow = TRUE) 
+p6_vertices <- matrix(c(-1488255, 1369734,  
+                        -1488630, 1369734,  
+                        -1488630, 1369977, 
+                        -1488255, 1370106,
+                        -1488255, 1369734),
+                      ncol = 2, byrow = TRUE) 
+p7_vertices <- matrix(c(-1488240, 1369419,  
+                        -1488615, 1369419,  
+                        -1488615, 1369794, 
+                        -1488240, 1369794,
+                        -1488240, 1369419),
+                      ncol = 2, byrow = TRUE) 
+p8_vertices <- matrix(c(-1488212, 1370120,  
+                        -1488191, 1370128,  
+                        -1488190, 1370120, 
+                        -1488212, 1370120),
+                      ncol = 2, byrow = TRUE)
+p9_vertices <- matrix(c(-1488970, 1369519,  
+                        -1488995, 1369519,  
+                        -1489008, 1369848, 
+                        -1488970, 1369861,
+                        -1488970, 1369519),
+                      ncol = 2, byrow = TRUE) 
+p10_vertices <- matrix(c(-1488970, 1369519,  
+                        -1488995, 1369519,  
+                        -1489008, 1369848, 
+                        -1488970, 1369861,
+                        -1488970, 1369519),
+                      ncol = 2, byrow = TRUE) 
+p11_vertices <- matrix(c(-1488518, 1369823,  
+                         -1488518, 1370016,  
+                         -1488191, 1370128, 
+                         -1488168, 1369823,
+                         -1488518, 1369823),
+                       ncol = 2, byrow = TRUE)
+p12_vertices <- matrix(c(-1488452, 1369986,  
+                         -1488452, 1370039,  
+                         -1488191, 1370128, 
+                         -1488180, 1369986,
+                         -1488452, 1369986),
+                       ncol = 2, byrow = TRUE)
+p13_vertices <- matrix(c(-1488705, 1369618,  
+                         -1488999, 1369618,  
+                         -1489008, 1369848, 
+                         -1488705, 1369952,
+                         -1488705, 1369618),
+                       ncol = 2, byrow = TRUE) 
+p14_vertices <- matrix(c(-1488804, 1369607,  
+                         -1488999, 1369607,  
+                         -1489008, 1369848, 
+                         -1488804, 1369918,
+                         -1488804, 1369607),
+                       ncol = 2, byrow = TRUE)
+p15_vertices <- matrix(c(-1488921, 1369704,  
+                         -1489002, 1369704,  
+                         -1489008, 1369848, 
+                         -1488921, 1369878,
+                         -1488921, 1369704),
+                       ncol = 2, byrow = TRUE) 
+p16_vertices <- matrix(c(-1488299, 1369901,  
+                         -1488674, 1369901,  
+                         -1488674, 1369962, 
+                         -1488299, 1370091,
+                         -1488299, 1369901),
+                       ncol = 2, byrow = TRUE)  
+p17_vertices <- matrix(c(-1488904, 1369779,  
+                         -1489005, 1369779,  
+                         -1489008, 1369848, 
+                         -1488904, 1369884,
+                         -1488904, 1369779),
+                       ncol = 2, byrow = TRUE) 
+p18_vertices <- matrix(c(-1488525, 1369926,  
+                         -1488780, 1369926,  
+                         -1488525, 1370013, 
+                         -1488525, 1369926),
+                       ncol = 2, byrow = TRUE) 
+
+### combine all of them into an sf df
+sf_boxes <- st_sf(pix_value = c(1:18),  # Unique identifier for each polygon
+  geometry = st_sfc(st_polygon(list(p1_vertices)),
+                    st_polygon(list(p2_vertices)),
+                    st_polygon(list(p3_vertices)),
+                    st_polygon(list(p4_vertices)),
+                    st_polygon(list(p5_vertices)),
+                    st_polygon(list(p6_vertices)),
+                    st_polygon(list(p7_vertices)),
+                    st_polygon(list(p8_vertices)),
+                    st_polygon(list(p9_vertices)),
+                    st_polygon(list(p10_vertices)),
+                    st_polygon(list(p11_vertices)),
+                    st_polygon(list(p12_vertices)),
+                    st_polygon(list(p13_vertices)),
+                    st_polygon(list(p14_vertices)),
+                    st_polygon(list(p15_vertices)),
+                    st_polygon(list(p16_vertices)),
+                    st_polygon(list(p17_vertices)),
+                    st_polygon(list(p18_vertices))),
+  crs = 6350)
+
+ggplot() +
+  geom_sf(data = polygon_extent, color = "gray") +
+  geom_sf(data = sf_boxes, aes(color = as.character(pix_value),
+                                  fill = as.character(pix_value)),
+          alpha = 0.2) +
+  NULL
+
+### rasterize
+dummy_raster <- st_rasterize(sf_boxes,
+                          st_as_stars(st_bbox(polygon_extent),
+                                      nx = 399,
+                                      ny = 460))
+plot(dummy_raster)
+```
+
