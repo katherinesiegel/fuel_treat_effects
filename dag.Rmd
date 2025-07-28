@@ -1,0 +1,50 @@
+---
+title: "dag"
+output: html_document
+date: "2024-11-07"
+---
+
+## Description
+Make DAG for RDD
+
+## Set up
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+### load packages
+library(tidyverse) ## for basic coding
+library(knitr) ## for rmarkdown
+library(ggdag) ## for making a directed acyclic graph (DAG)
+```
+
+## DAG
+```{r echo = FALSE, message = FALSE, warning = FALSE, fig.width = 10, fig.height = 10}
+
+### make dag
+fire_sev_dag <- dagify(fire_sev ~ treat_status + confound_covar,
+                   treat_status ~ confound_covar,
+                   
+                   ### label nodes
+                   labels = c("fire_sev" = "Fire severity",
+                              "treat_status" = "Treatment status",
+                              "confound_covar" = "Climate,\n geographic,\n and human\n covariates"),
+                   exposure = "treat_status",
+                   outcome = "fire_sev",
+                   
+                   ### add coordinates
+                   coords = list(x = c(treat_status = 1, 
+                                       fire_sev = 3,
+                                       confound_covar = 2),
+                                 y = c(treat_status = 1, 
+                                       fire_sev = 1,
+                                       confound_covar = 2)))
+
+### plot dag
+ggdag_status(fire_sev_dag,
+             use_labels = "label",
+             text = FALSE,
+             label_alpha = 0.5) +
+  guides(fill = FALSE, color = FALSE) +
+  theme_dag()
+```
+
