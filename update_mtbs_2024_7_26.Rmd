@@ -6170,7 +6170,8 @@ st_write(fm_sample,
          "E:/fuel_treat/esa_subset/esa_sample_pts_test.shp",
          append = FALSE)
 ```
-## ESA fires and fuel treatments
+
+## 1. ESA fires and fuel treatments
 ```{r}
 ### open fires with single fuel treatment in forest
 fires_forest <- st_read("E:/fuel_treat/ft_polys/burned_ft/burned_ft_lc/fires_forest.shp")
@@ -6241,9 +6242,9 @@ st_write(ft_fires,
          "E:/fuel_treat/esa_subset/esa_fts.shp",
          append = FALSE)
 ```
+
 ### deal with adjacent fires
 Some of the fires in esa_fires.shp are actually parts of the same fire
-
 ```{r}
 ### open fires
 all_fires <- st_read("E:/fuel_treat/esa_subset/esa_fires.shp")
@@ -6288,6 +6289,250 @@ st_write(fires_merged,
          "E:/fuel_treat/esa_subset/esa_fires_simp.shp",
          append = FALSE)
 ```
+
+### check for perfect overlap in fires
+```{r}
+### open fires
+fires <- st_read("E:/fuel_treat/esa_subset/esa_fires_simp.shp")
+
+### check for duplicated geometries
+same_geom <- st_equals(fires)
+
+### pull out duplicated geoms
+dup_groups <- unique(lapply(same_geom, sort))
+dup_groups <- dup_groups[sapply(dup_groups, length) > 1]
+dup_groups <- dup_groups[!duplicated(dup_groups)]
+
+### get max group size
+max_cols <- max(sapply(dup_groups, length))
+
+### grab poly_ids
+dup_ids <- lapply(dup_groups, function(group) {
+  ids <- fires$Event_ID[group]
+  length(ids) <- max_cols  
+  return(ids)
+})
+
+### as df
+dup_df <- as.data.frame(do.call(rbind, dup_ids))
+colnames(dup_df) <- paste0("Event_ID_", seq_len(ncol(dup_df)))
+
+### the fires that overlap are 411 and 412
+
+### drop fire 412 from dataset since it completely overlaps and ig_date is earlier for 411
+fires <- fires %>%
+  filter(!Event_ID == "412")
+
+### write out
+st_write(fires, 
+         "E:/fuel_treat/esa_subset/esa_fires_simp_fix.shp")
+
+# ### check out some overlaps
+# check <- ft_footprint %>%
+#   filter(poly_id %in% c("10000", "122671", "56437")) ### same year
+
+# ### drop geom from ft_footprint
+# ft_info <- fires
+# st_geometry(ft_info) <- NULL
+# rm(fires)
+# gc()
+
+#############################################
+### see if the date_comp is also the same
+#############################################
+to_check <- c("date_comp", "Event_ID")
+
+### check if values are the same
+all_equal_or_na <- function(x) {
+  x <- na.omit(x)
+  length(unique(x)) <= 1
+}
+
+### list to store output
+attribute_consistency <- lapply(to_check, function(attr_name) {
+  sapply(1:nrow(dup_df), function(i) {
+    
+    ### get poly_id
+    ids <- dup_df[i, , drop = TRUE]
+    ids <- ids[!is.na(ids)]
+    
+    ### get col vals
+    vals <- ft_info[[attr_name]][ft_info$pid_unique %in% ids]
+    
+    ### check if vals are the same
+    all_equal_or_na(vals)
+  })
+})
+
+### put into df
+consist_df <- as.data.frame(attribute_consistency)
+names(consist_df) <- to_check
+consist_df$group_id <- 1:nrow(dup_df)
+consist_df <- cbind(group = apply(dup_df, 1, paste, collapse = ","), consist_df)
+
+### which polys have the same date, etc?
+consistent_groups <- consist_df[apply(consist_df[to_check], 1, all), ]
+
+### date_comp can differ but same fire
+consist_eventid <- consist_df %>%
+  filter(Event_ID == TRUE)
+
+### write out dups 
+write_csv(consistent_groups,
+          "E:/fuel_treat/ft_polys/same_poly_ft_match_update.csv")
+write_csv(consist_df,
+          "E:/fuel_treat/ft_polys/same_poly_ft_diff_attributes_update.csv")
+write_csv(dup_df,
+          "E:/fuel_treat/ft_polys/same_poly_ft_attr_unchecked_update.csv")
+write_csv(consist_eventid,
+          "E:/fuel_treat/ft_polys/same_poly_ft_same_fire_update.csv")
+```
+##### check
+```{r}
+ft <- st_read("E:/fuel_treat/esa_subset/esa_fts.shp")
+
+ft_check <- ft %>% filter(Event_ID == "127720")
+
+contained <- st_within(ft_check, fires, sparse = FALSE)
+
+### get the fire without the ft
+no_intersect_i <- rmapshaper::ms_erase(fires, ft_check)
+  
+### get just the part of use_ft that's inside the fire
+use_ft_crop_i <- st_intersection(ft_check, fires)
+
+### give them the same column names, standardize and clean geoms
+### no intersection
+no_intersect_i <- no_intersect_i %>%
+  dplyr::select(Event_ID, geometry) %>%
+  st_make_valid() %>%
+  st_buffer(0)
+
+### inner lines
+use_ft_crop_i <- use_ft_crop_i %>%
+  dplyr::select(Event_ID = poly_id, geometry)%>%
+  st_make_valid() %>%
+  st_buffer(0)
+
+### combine them
+comb_sf <- rbind(no_intersect_i,
+                 use_ft_crop_i)
+
+### make valid and fix geoms
+comb_sf <- comb_sf %>%
+  st_make_valid() %>%
+  st_buffer(0) %>%
+  st_set_precision(1e6)
+
+### union geoms to dissolve overlaps
+comb_sf_union <- comb_sf %>%
+  group_by(Event_ID) %>%
+  summarise(geometry = st_union(geometry)) %>%
+  ungroup() %>%
+  st_make_valid()
+
+### make inner line
+inner_line <- comb_sf_union %>%
+  ms_innerlines() %>%
+  # as_tibble() %>%
+  st_as_sf()
+
+### add the inner line to the result
+
+### make sure there's a value
+if (!is_empty(inner_line)) {  
+  
+  ### add it to the output list
+  boundary_polys[[i]] <- inner_line
+  
+}
+
+# ### deal with situations where fire is contained by ft
+# if (st_within(fire, fts[i, ], sparse = FALSE)) {
+
+# ### get ft if fire inside ft
+# fully_contained_inner_line <- st_difference(fts[i, ], fire)
+
+### deal with situations where fire is inside ft
+fully_contained <- st_within(fires, ft_check, sparse = FALSE)
+
+### check if all fire geoms are fully contained within ft
+if (all(fully_contained)) {
+  
+  ### when fire is fully contained, grab the ft's inner lines 
+  fully_contained_inner_line <- st_difference(ft_check, fires)
+  
+  ### convert to MULTILINESTRING if necessary
+  if (inherits(st_geometry(fully_contained_inner_line), "sfc_LINESTRING")) {
+    fully_contained_inner_line <- st_cast(fully_contained_inner_line, "MULTILINESTRING")
+  }
+  
+  ### if it's a MULTILINESTRING, merge and add it
+  if (inherits(st_geometry(fully_contained_inner_line), "sfc_MULTILINESTRING")) {
+    fully_contained_inner_line <- st_line_merge(fully_contained_inner_line)
+    
+    ### add to result list
+    boundary_polys[[i]] <- fully_contained_inner_line
+  }
+}
+   
+```
+
+
+##### deal with complete overlaps
+```{r}
+### open fires
+fires_merged <- st_read("E:/fuel_treat/esa_subset/esa_fires_simp.shp")
+
+### set overlap threshold
+overlap_thresh <- 0.01
+
+### make col for overlaps
+fires_merged$merged <- FALSE
+
+### loop through each fire and compare geometries within the same group
+for (i in 1:nrow(fires_merged)) {
+  for (j in 1:nrow(fires_merged)) {
+    if (i != j) {
+      # Check if geometries are identical (exact overlap)
+      if (isTRUE(st_equals(fires_merged$geometry[i], fires_merged$geometry[j]))) {
+        # If geometries are identical, mark them as merged
+        fires_merged$merged[i] <- TRUE
+        fires_merged$merged[j] <- TRUE
+      } else {
+        # Otherwise, check for near-perfect overlap based on area
+        if (abs(as.numeric(st_area(fires_merged$geometry[i])) - as.numeric(st_area(fires_merged$geometry[j]))) < overlap_thresh) {
+          # If the area difference is small and ignition dates are close, mark them as merged
+          if (abs(as.numeric(difftime(fires_merged$Ig_Date[i], fires_merged$Ig_Date[j], units = "days"))) <= 20) {
+            fires_merged$merged[i] <- TRUE
+            fires_merged$merged[j] <- TRUE
+          }
+        }
+      }
+    }
+  }
+}
+
+### merge the geoms for the non-merged fires
+fires_merged_final <- fires_merged %>%
+  filter(!merged) %>%
+  arrange(Ig_Date) %>%
+  summarise(
+    Ig_Date = first(Ig_Date),  # Keep the first ignition date (or use min/max)
+    Event_ID = first(Event_ID), # First Event_ID (or adjust as needed)
+    n_fires = n(),
+    geometry = st_union(geometry), # Merge geometries
+    .groups = "drop")
+
+# Step 6: Optionally, handle merged fires separately (if you'd like to process them)
+merged_fires <- adjacent_fires %>%
+  filter(merged)
+
+# Step 7: Save the results (if you need to output the merged shapefile)
+st_write(fires_merged_final, "E:/fuel_treat/esa_subset/esa_fires_simp_2.shp")
+```
+
+
 #### deal with CBI rasters
 ```{r}
 ### lookup table- each row lists Event_IDs that belong to the same group
@@ -6342,6 +6587,132 @@ for (i in seq_len(nrow(event_groups))) {
 }
 
 ```
+
+### Treatment boundaries
+```{r}
+### open data
+setwd("~/data-store/data/iplant/home/kjsiegel/fuel_treat/esa")
+fire <- st_read("esa_fires_simp.shp")
+fts <- st_read("esa_fts.shp")
+
+### drop fire 412 from dataset because perfect overlap with 411
+fire <- fire %>%
+  filter(!Event_ID == "412")
+
+### set precision and make valid
+fts <- st_set_precision(fts, 1e6) %>% st_make_valid()
+fire <- st_set_precision(fire, 1e6) %>% st_make_valid()
+
+# Output list
+boundary_polys <- list()
+
+# Loop through each feature in fts
+for (i in 1:nrow(fts)) {
+  cat("Processing row", i, "\n")  # Optional debug message
+  
+  polygon_i <- fts[i, ]
+  
+  contained <- st_within(polygon_i, fire, sparse = FALSE)
+  
+  if (!FALSE %in% contained) {
+    # Fully contained in fire — just keep the polygon itself
+    polygon_i <- polygon_i %>%
+      dplyr::select(geometry)
+    
+    if (!is.null(polygon_i) && nrow(polygon_i) > 0 && !all(st_is_empty(polygon_i))) {
+      boundary_polys[[i]] <- polygon_i
+    }
+    
+  } else {
+    # Fire without this ft
+    no_intersect_i <- rmapshaper::ms_erase(fire, fts[i, ])
+    
+    # Portion of ft inside fire
+    use_ft_crop_i <- st_intersection(fts[i, ], fire)
+    
+    # Clean geometries
+    no_intersect_i <- no_intersect_i %>%
+      dplyr::select(Event_ID, geometry) %>%
+      st_make_valid() %>%
+      st_buffer(0)
+    
+    use_ft_crop_i <- use_ft_crop_i %>%
+      dplyr::select(Event_ID = poly_id, geometry) %>%
+      st_make_valid() %>%
+      st_buffer(0)
+    
+    # Combine and dissolve
+    comb_sf <- rbind(no_intersect_i, use_ft_crop_i) %>%
+      st_make_valid() %>%
+      st_buffer(0) %>%
+      st_set_precision(1e6)
+    
+    comb_sf_union <- comb_sf %>%
+      group_by(Event_ID) %>%
+      summarise(geometry = st_union(geometry)) %>%
+      ungroup() %>%
+      st_make_valid()
+    
+    # Create inner lines
+    inner_line <- try(ms_innerlines(comb_sf_union) %>% st_as_sf(), silent = TRUE)
+    
+    if (!inherits(inner_line, "try-error") && !is.null(inner_line) &&
+        nrow(inner_line) > 0 && !all(st_is_empty(inner_line))) {
+      boundary_polys[[i]] <- inner_line
+    }
+    
+    # Check if fire is fully inside ft
+    fully_contained <- st_within(fire, fts[i, ], sparse = FALSE)
+    
+    if (all(fully_contained)) {
+      fully_contained_inner_line <- st_difference(fts[i, ], fire)
+      
+      if (!st_is_empty(fully_contained_inner_line)) {
+        if (inherits(st_geometry(fully_contained_inner_line), "sfc_LINESTRING")) {
+          fully_contained_inner_line <- st_cast(fully_contained_inner_line, "MULTILINESTRING")
+        }
+        
+        if (inherits(st_geometry(fully_contained_inner_line), "sfc_MULTILINESTRING")) {
+          fully_contained_inner_line <- st_line_merge(fully_contained_inner_line)
+        }
+        
+        if (!is.null(fully_contained_inner_line) && !all(st_is_empty(fully_contained_inner_line))) {
+          boundary_polys[[i]] <- fully_contained_inner_line
+        }
+      }
+    }
+  }
+}
+
+# Clean list: remove null or empty entries
+boundary_polys_clean <- boundary_polys[!sapply(boundary_polys, function(x) {
+  is.null(x) || inherits(x, "try-error") || nrow(x) == 0 || all(st_is_empty(x))
+})]
+
+# Combine into one sf object
+result <- do.call(rbind, boundary_polys_clean) %>% st_make_valid()
+
+# # View result
+# plot(st_geometry(result))
+
+st_write(result,
+         "~/data-store/data/iplant/home/kjsiegel/fuel_treat/esa/ft_fire_boundaries_fix_overlap.shp")
+```
+
+### clean up sample points
+Drop points from fire that is fully contained by treatment
+```{r}
+### open sample pts
+esa <- st_read("E:/fuel_treat/esa_subset/esa_sample_pts.shp")
+
+### remove points in fire_ids 127720 and 127745
+esa <- esa %>%
+  filter(!fire_id %in% c("127720", "127745"))
+
+### write out
+st_write(esa, "E:/fuel_treat/esa_subset/esa_sample_pts_simp.shp")
+```
+
 ## Covariates
 ### topography
 #### TPI
@@ -6558,6 +6929,8 @@ evi_files <- evi_files %>%
 write_csv(evi_files, "E:/fuel_treat/covars/evi.csv")
 ```
 
+## Climate 
+
 ## VIIRS
 From viirs_code.Rmd
 
@@ -6565,7 +6938,590 @@ Gets VIIRS detections from GEE, intersects them with the fire perimeters, then r
 
 Note that VIIRS started in 2012, so we don't have VIIRS data for any fires pre-2012
 
+## EPA Ecoregions
+### by points
+```{r}
+### open pts
+esa <- st_read("E:/fuel_treat/esa_subset/esa_sample_pts.shp")
+  
+### simplify
+esa <- esa %>%
+  dplyr::select(uid, geometry)
 
+### open ecoregions
+ecoreg <- st_read("E:/fuel_treat/epa_ecoregions/us_eco_l3.shp") %>%
+  st_transform(., crs = 6350)
+
+ggplot() + 
+  geom_sf(data = ecoreg, 
+          aes(color = NA_L2NAME, fill = NA_L2NAME))
+
+### simplify ecoregions
+ecoreg <- ecoreg %>%
+  filter(!NA_L1NAME %in% c("EASTERN TEMPERATE FORESTS",
+                           "TROPICAL WET FORESTS")) %>%
+  filter(!NA_L2NAME %in% c("ATLANTIC HIGHLANDS",
+                           "MIXED WOOD SHIELD",
+                           "TEXAS-LOUISIANA COASTAL PLAIN"))
+
+### simplify
+ecoreg <- ecoreg %>%
+  dplyr::select(NA_L3NAME, NA_L2NAME, NA_L1NAME, geometry)
+
+### set up parallels
+plan(multisession, workers = 8)
+
+### make chunks
+# chunk_size <- 100000  # Size of each chunk (adjust as needed)
+esa_chunks <- split(esa, 
+                    ceiling(seq_along(esa$geometry) / 100000))
+
+### intersect
+result_chunks <- future_map(esa_chunks, 
+                            ~ st_intersection(.x, ecoreg))
+# esa_eco <- st_intersection(esa, ecoreg)
+
+### combine
+final_result <- do.call(rbind, result_chunks)
+
+### simplify
+final_result <- final_result %>%
+  dplyr::select(uid, 
+                ecoreg_1 = NA_L1NAME,
+                ecoreg_2 = NA_L2NAME,
+                ecoreg_3 = NA_L3NAME,
+                geometry)
+
+### drop geom
+st_geometry(final_result) <- NULL
+
+### write out fires and ecoregions
+write_csv(final_result, "E:/fuel_treat/covars/ecoregion.csv")
+```
+
+### by fire
+```{r}
+### open fires we're using
+fires_ft <- st_read("E:/fuel_treat/burned_ft_fires_use.shp")
+
+### open ecoregions
+ecoreg <- st_read("E:/fuel_treat/epa_ecoregions/us_eco_l3.shp") %>%
+  st_transform(., crs = 6350)
+
+### simplify ecoregions
+ecoreg <- ecoreg %>%
+  filter(!NA_L1NAME %in% c("EASTERN TEMPERATE FORESTS",
+                           "TROPICAL WET FORESTS"))
+
+### intersect
+fires_eco <- st_intersection(fires_ft, ecoreg)
+
+### simplify
+fires_eco <- fires_eco %>%
+  dplyr::select(Event_ID, 
+                ecoreg_1 = NA_L1NAME,
+                ecoreg_2 = NA_L2NAME,
+                ecoreg_3 = NA_L3NAME,
+                geometry)
+
+### see which fires aren't in just 1 ecoregion
+check <- fires_eco
+st_geometry(check) <- NULL
+check_summ <- check %>% 
+  group_by(Event_ID) %>% 
+  summarise(n_ecoreg = length(unique(ecoreg_3)))
+check_summ <- check_summ %>% 
+  filter(n_ecoreg > 1)
+
+### 3619 fires are just in 1 ecoregion, but 313 burned across ecoregions
+fires_across <- fires_eco %>%
+  filter(Event_ID %in% check_summ$Event_ID)
+
+### write out fires and ecoregions
+st_write(fires_eco, "E:/fuel_treat/epa_ecoregions/fires_ecoreg.shp")
+```
+
+## Combine covariates
+```{r}
+### open ecoreg
+ecoreg <- read.csv("E:/fuel_treat/covars/ecoregion.csv")
+
+### open lcmap
+lcmap <- read.csv("E:/fuel_treat/covars/lcmap.csv")
+
+### combine
+ecoreg <- merge(x = ecoreg,
+                y = lcmap,
+                by = "uid",
+                all = TRUE)
+
+### clean
+rm(lcmap)
+gc()
+
+### open dem
+dem <- read.csv("E:/fuel_treat/covars/dem.csv")
+
+### simplify cols
+dem <- dem %>%
+  dplyr::select(uid, elevation, slope, aspect_srai)
+
+### combine
+ecoreg <- merge(x = ecoreg,
+                y = dem,
+                by = "uid",
+                all = TRUE)
+
+### clean
+rm(dem)
+gc()
+
+### open tpi
+tpi <- read.csv("E:/fuel_treat/covars/tpi.csv") %>%
+  dplyr::select(., uid, tpi)
+
+### combine
+ecoreg <- merge(x = ecoreg,
+                y = tpi,
+                by = "uid",
+                all = TRUE)
+
+### write out
+write_csv(ecoreg,
+          "E:/fuel_treat/covars/esa_covars.csv")
+```
+
+## Extract ft info
+```{r}
+### open pts
+esa <- st_read("E:/fuel_treat/esa_subset/esa_sample_pts.shp")
+
+### simplify cols
+esa <- esa %>%
+  dplyr::select(uid, fire_id, fire_year, geometry)
+
+### open fts
+fts <- st_read("E:/fuel_treat/esa_subset/esa_fts.shp")
+
+### set up parallels for intersection
+plan(multisession, workers = 8)
+
+### make chunks
+# chunk_size <- 100000  # Size of each chunk (adjust as needed)
+esa_chunks <- split(esa, 
+                    ceiling(seq_along(esa$geometry) / 100000))
+
+### intersect in parallel
+result_chunks <- future_map(esa_chunks, ~ {
+  
+  ### filter to fts that burned in the right fire
+  chunk_fire_ids <- unique(.x$fire_id) 
+  
+  ## filter fts 
+  filtered_fts <- fts %>% 
+    filter(Event_ID %in% chunk_fire_ids)
+  
+  ### intersect
+  intersections <- st_intersection(.x, filtered_fts)
+  
+  ### return
+  return(intersections)
+})
+
+### combine
+final_result <- do.call(rbind, result_chunks)
+
+### remove geom
+st_geometry(final_result) <- NULL
+
+### add column for treated
+final_result <- final_result %>%
+  mutate(treat_status = "treated")
+
+### drop fire_id from esa_ft
+final_result <- final_result %>%
+  dplyr::select(-fire_id)
+
+### drop event id from final_result
+final_result <- final_result %>%
+  dplyr::select(-Event_ID)
+
+### merge with esa 5454704
+esa_ft <- merge(x = esa, 
+                y = final_result,
+                by = c("uid", "fire_year"),
+                all.x = TRUE)
+
+### drop geom
+st_geometry(esa_ft) <- NULL
+
+### make distinct
+esa_ft <- distinct(esa_ft)
+
+### keep earliest ignition date
+esa_ft_simp <- esa_ft %>%
+  arrange(Ig_Date) %>%
+  group_by(uid, pid_unique, poly_id, date_comp, act_code, source, state, treat_status) %>%
+  slice_min(order_by = Ig_Date, n = 1) %>%
+  ungroup()
+
+### write out
+write_csv(esa_ft_simp,
+          "E:/fuel_treat/esa_subset/esa_sample_pts_ft.csv")
+
+# ### figure out repeats
+# esa_check <- esa_ft_simp %>%
+#   group_by(uid) %>%
+#   summarise(n_occur = n()) %>%
+#   ungroup() %>%
+#   filter(n_occur > 1)
+# 
+# ### filter to these
+# esa_check_dup <- esa_ft_simp %>%
+#   filter(uid %in% esa_check$uid)
+# 
+# ### find date difference
+# esa_check_dates <- esa_check %>%
+#   arrange(uid, Ig_Date) %>%
+#   group_by(uid) %>%
+#   mutate(diff_date = c(NA, diff(Ig_Date)))
+# 
+# ### look at UIDs where diff_date > 27 days
+# esa_check_long <- esa_check_dates %>%
+#   filter(diff_date > 27)
+# 
+# ### filter to these ones
+# esa_check_long_diff <- esa_ft %>%
+#   filter(uid %in% esa_check_long$uid)
+```
+
+## Time since treatment
+```{r}
+### open pts with ft info
+esa_ft_simp <- read.csv("E:/fuel_treat/esa_subset/esa_sample_pts_ft.csv")
+
+### open pts
+pts <- st_read("E:/fuel_treat/esa_subset/esa_sample_pts_simp.shp")
+
+### filter to pts in pts
+esa_ft_simp_pts <- esa_ft_simp %>%
+  filter(uid %in% pts$uid)
+
+### convert dates
+esa_ft_simp_pts$Ig_Date <- as.Date(esa_ft_simp_pts$Ig_Date)
+esa_ft_simp_pts$date_comp <- as.Date(esa_ft_simp_pts$date_comp)
+
+### add time elapsed from treatment to fire
+esa_ft_simp_pts <- esa_ft_simp_pts %>%
+  mutate(days_elapsed = as.numeric(difftime(Ig_Date, date_comp, units = "days")),
+         wks_elapsed = round(as.numeric(difftime(Ig_Date, date_comp, units = "weeks")), 0)) %>%
+  mutate(yrs_elapse = round(days_elapsed/365.25, 1))
+
+### open ft categories
+categories <- read.csv("E:/fuel_treat/ft_polys/all_ft_category.csv") %>%
+  dplyr::select(., act_code, activity_cat, fire_id = Event_ID, poly_id, source, state)
+categories <- distinct(categories)
+
+### make join col
+categories <- categories %>%
+  mutate(join_id = paste0(fire_id, "_", poly_id))
+esa_ft_simp_pts <- esa_ft_simp_pts %>%
+  mutate(join_id = paste0(fire_id, "_", poly_id))
+
+### add categories to pts
+pts_activities <- merge(x = esa_ft_simp_pts,
+                        y = categories, 
+                        # by = "act_code",
+                        by = "join_id",
+                        all.x = TRUE)
+
+### drop nas
+pts_activities <- pts_activities %>%
+  filter(!is.na(treat_status))
+
+pts_activities <- pts_activities %>%
+  mutate(activity_cat = ifelse(act_code.x == "1113",
+                               "fire_ft",
+                               activity_cat))
+
+### NAs
+na_activity <- pts_activities %>%
+  filter(is.na(activity_cat))
+
+### drop NAs
+pts_activities <- pts_activities %>%
+  filter(!is.na(activity_cat))
+
+ggplot() +
+  geom_histogram(data = pts_activities, 
+                 aes(x = yrs_elapse,
+                     color = activity_cat,
+                     fill = activity_cat)) +
+  xlab("Years from treatment to wildfire") +
+  ylab("Number of treatments") +
+  theme_bw()
+```
+
+## Distance to boundaries
+```{r}
+### open inner lines
+lines_fires <- st_read("E:/fuel_treat/esa_subset/ft_boundaries/inner_lines.shp")
+
+### open sample points
+pts <- st_read("E:/fuel_treat/esa_subset/esa_sample_pts_simp.shp")
+
+### remove fire CA3320411691620031026 (2003) because it burned over ft previously burned in CA3314611689619930509 (1993)
+pts <- pts %>%
+  filter(!fire_id == "CA3320411691620031026")
+
+### drop associated inner line
+lines_fires <- lines_fires %>%
+  filter(!Event_ID == "CA3320411691620031026")
+
+### set up parallels
+options(future.globals.maxSize = 2 * 1024^3)
+plan(multisession)
+
+### function to get dist for each pt
+get_dist_df <- function(i) {
+  
+  ### get pt
+  pt_i <- pts[i, ]
+  
+  ### get line
+  line_i <- lines_fires %>%
+    filter(Event_ID %in% pt_i$fire_id)
+  
+  ### deal with NAs
+  if (nrow(line_i) == 0) {
+    return(data.frame(uid = pt_i$uid, 
+                      dist_bound = NA_real_))
+  }
+  
+  ### calculate distance
+  dist_i <- st_distance(pt_i, line_i)
+  
+  ### make df
+  df_i <- data.frame(uid = pt_i$uid,
+                     dist_bound = as.numeric(dist_i))
+  
+  ### return df
+  return(df_i)
+}
+
+### run in parallel
+dist_list <- future_map(1:nrow(pts), 
+                        get_dist_df,
+                        .progress = TRUE,
+                        .options = furrr_options(seed = TRUE))
+
+dist_df <- do.call(rbind, dist_list)
+
+### combine with pt attributes
+pt_att <- pts %>%
+  dplyr::select(uid, fire_id)
+st_geometry(pt_att) <- NULL
+dist_df <- merge(x = dist_df,
+                 y = pt_att,
+                 by = "uid",
+                 all = TRUE)
+```
+
+## 2. Next batch of fires and fuel treatments
+Use fires I've already downloaded CBI
+```{r}
+### figure out which fp fires I have
+fp_fires <- list.files(path = "E:/fuel_treat/firedpy/cbi_gee_firedpy",
+                       pattern = "*_CBI_bc.tif",
+                       full.names = TRUE)
+fp_file_base <- basename(fp_fires)
+fp_file_name <- sub("_CBI_bc\\.tif$", "", fp_file_base)
+
+### figure out which mtbs fires I have
+mt_fires <- list.files(path = "E:/fuel_treat/mtbs/cbi_gee_mtbs",
+                       pattern = "*_CBI_bc.tif",
+                       full.names = TRUE)
+mt_file_base <- basename(mt_fires)
+mt_file_name <- sub("_CBI_bc\\.tif$", "", mt_file_base)
+
+### combine vectors
+all_files <- c(fp_file_name, mt_file_name)
+
+### ESA fires
+fire <- st_read("E:/fuel_treat/esa_subset/esa_fires_simp.shp")
+
+### open all fires with burned fts
+fires_ft <- st_read("E:/fuel_treat/burned_ft_fires_use.shp")
+
+### remove fires done in ESA round
+fires_ft <- fires_ft %>%
+  filter(!Event_ID %in% fire$Event_ID)
+
+### clean up
+rm(fire)
+gc()
+```
+
+#### still need CBI
+```{r}
+### fires that still need CBI
+fires_cbi <- fires_ft %>%
+  filter(!Event_ID %in% all_files)
+
+### open mtbs and firedpy (raw versions to avoid splits across state boundaries)
+mtbs <- st_read("E:/fuel_treat/mtbs/mtbs_perims_DD.shp")
+fired <- st_read("E:/fuel_treat/firedpy/firedpy_2000_2024_west_nonrx.shp")
+
+### subset to fires I still need
+mtbs <- mtbs %>%
+  filter(Event_ID %in% fires_cbi$Event_ID)
+fired <- fired %>%
+  filter(Event_ID %in% fires_cbi$Event_ID)
+
+### extract state as column
+mtbs <- mtbs %>%
+  mutate(state = stringr::str_extract(Event_ID, "^.{2}"))
+
+### simplify to combine
+mtbs <- mtbs %>%
+  dplyr::select(Event_ID, Incid_Type, Ig_Date, state, geometry)
+fired <- fired %>%
+  dplyr::select(Event_ID, Incid_Type, Ig_Date, state, geometry)
+
+### align crs
+mtbs <- mtbs %>%
+  st_transform(6350)
+
+### combine
+fm <- rbind(mtbs, fired)
+
+################################
+### deal with adjacent fires
+################################
+
+### figure out which fires overlap
+adj_matrix <- st_intersects(fm, sparse = FALSE)
+
+### figure out which have similar dates too
+date_diff_matrix <- outer(fm$Ig_Date, 
+                          fm$Ig_Date, 
+                          function(x, y) abs(as.numeric(difftime(x, y, units = "days"))))
+
+### set distance between ignition dates
+n_days <- 28
+
+### make combined adjacency condition: polygons touch AND ignition dates are within 28 days from each other
+combined_matrix <- adj_matrix & (date_diff_matrix <= n_days)
+
+### make graph of connected components
+g <- graph_from_adjacency_matrix(combined_matrix, mode = "undirected")
+
+### assign group ids based on connected components
+fm$group_id <- components(g)$membership
+
+### combine geometries for grouped polygons
+fires_merged <- fm %>%
+  group_by(group_id) %>%
+  arrange(Ig_Date) %>%
+  summarise(
+    
+    ### keep earliest ignition date and corresponding Event_ID
+    Ig_Date = first(Ig_Date), 
+    Event_ID = first(Event_ID),
+    
+    ### keep track of the number of merged fires
+    n_fires = n(),
+    geometry = st_union(geometry),
+    .groups = "drop")
+st_write(fires_merged, "E:/fuel_treat/fires_gee_post_esa_merged.shp")
+```
+##### prep for GEE
+```{r}
+### prep cols for GEE
+
+### bring in state col
+state_fm <- fm 
+st_geometry(state_fm) <- NULL
+state_fm <- state_fm %>%
+  dplyr::select(Event_ID, state)
+fires_merged <- merge(x = fires_merged,
+                      y = state_fm,
+                      by = "Event_ID",
+                      all.x = TRUE)
+
+### drop unnecessary cols
+fires_gee <- fires_merged %>%
+  dplyr::select(-group_id, -n_fires) %>%
+  mutate(Fire_Year = year(Ig_Date),
+         Start_Day = ifelse(state %in% c("AZ", "NM"), 91, 152),
+         End_Day = ifelse(state %in% c("AZ", "NM"), 181, 258)) %>%
+  dplyr::select(Fired_ID = Event_ID, Fire_Year, Start_Day, End_Day, geometry)
+
+### Make sure date columns don't get read in with decimals
+fires_gee$Fire_Year <- as.character(fires_gee$Fire_Year, 0)
+fires_gee$Start_Day <- as.character(fires_gee$Start_Day, 0)
+fires_gee$End_Day <- as.character(fires_gee$End_Day, 0)
+
+### transform
+fires_gee <- fires_gee %>%
+  st_transform(crs = 6350)
+
+### write out
+st_write(fires_gee,
+         "E:/fuel_treat/fires_gee_post_merged.shp",
+         append = FALSE)
+```
+#### get associated fts
+```{r}
+### open fuel treatments (full, not just burned)
+ft_footprint <- st_read("E:/fuel_treat/ft_polys/burned_ft/all_ft_burned_full_poly_update.gpkg")
+
+### filter to fires
+ft_fires <- ft_footprint %>%
+  filter(Event_ID %in% fm$Event_ID)
+
+### simplify fm 
+fm_simp <- fm
+st_geometry(fm_simp) <- NULL
+fm_simp <- fm_simp %>%
+  dplyr::select(-state)
+
+### combine
+ft_fires <- merge(x = ft_fires,
+                  y = fm_simp,
+                  by = "Event_ID",
+                  all.x = TRUE)
+
+### want the event_id from fires_merged
+fires_simp <- fires_merged
+st_geometry(fires_simp) <- NULL
+fires_simp <- fires_simp %>%
+  dplyr::select(group_id,
+                ig_date_keep = Ig_Date,
+                event_id_keep = Event_ID)
+
+### merge in
+ft_fires_group <- merge(x = ft_fires,
+                        y = fires_simp,
+                        by = "group_id",
+                        all.x = TRUE)
+
+### simplify
+ft_fires_group <- ft_fires_group %>%
+  dplyr::select(-Event_ID, -Ig_Date)
+
+### drop dups (43870 dropped to 43348)
+ft_fires_group <- ft_fires_group %>% distinct()
+
+### rename cols
+ft_fires_group <- ft_fires_group %>%
+  rename(Event_ID = event_id_keep,
+         Ig_Date = ig_date_keep)
+
+### write out
+st_write(ft_fires_group,
+         "E:/fuel_treat/ft_polys/burned_ft/all_ft_burned_full_poly_update_postesa.gpkg")
+```
 
 
 ## Categorize mech vs rx fire
@@ -6633,50 +7589,8 @@ Note that VIIRS started in 2012, so we don't have VIIRS data for any fires pre-2
 #### 8200: mechanical (1), fire (6)
 ```
 
-## EPA Ecoregions
-```{r}
-### open fires we're using
-fires_ft <- st_read("E:/fuel_treat/burned_ft_fires_use.shp")
-
-### open ecoregions
-ecoreg <- st_read("E:/fuel_treat/epa_ecoregions/us_eco_l3.shp") %>%
-  st_transform(., crs = 6350)
-
-### simplify ecoregions
-ecoreg <- ecoreg %>%
-  filter(!NA_L1NAME %in% c("EASTERN TEMPERATE FORESTS",
-                           "TROPICAL WET FORESTS"))
-
-### intersect
-fires_eco <- st_intersection(fires_ft, ecoreg)
-
-### simplify
-fires_eco <- fires_eco %>%
-  dplyr::select(Event_ID, 
-                ecoreg_1 = NA_L1NAME,
-                ecoreg_2 = NA_L2NAME,
-                ecoreg_3 = NA_L3NAME,
-                geometry)
-
-### see which fires aren't in just 1 ecoregion
-check <- fires_eco
-st_geometry(check) <- NULL
-check_summ <- check %>% 
-  group_by(Event_ID) %>% 
-  summarise(n_ecoreg = length(unique(ecoreg_3)))
-check_summ <- check_summ %>% 
-  filter(n_ecoreg > 1)
-
-### 3619 fires are just in 1 ecoregion, but 313 burned across ecoregions
-fires_across <- fires_eco %>%
-  filter(Event_ID %in% check_summ$Event_ID)
-
-### write out fires and ecoregions
-st_write(fires_eco, "E:/fuel_treat/epa_ecoregions/fires_ecoreg.shp")
-```
-
-
 ### UPDATE FROM HERE?
+
 ## Wildfires for CBI
 Fires I need to add since updating the dataset
 ```{r}
