@@ -41,6 +41,7 @@ library(future.apply)
 # library(nngeo)
 library(igraph)
 library(purrr)
+library(data.table)
 ```
 
 Code adapted from west_us.Rmd
@@ -6713,6 +6714,754 @@ esa <- esa %>%
 st_write(esa, "E:/fuel_treat/esa_subset/esa_sample_pts_simp.shp")
 ```
 
+## Distance to boundaries
+update with code from cyverse
+```{r}
+### open inner lines
+lines_fires <- st_read("E:/fuel_treat/esa_subset/ft_boundaries/inner_lines.shp")
+
+### open sample points
+pts <- st_read("E:/fuel_treat/esa_subset/esa_sample_pts_simp.shp")
+
+### remove fire CA3320411691620031026 (2003) because it burned over ft previously burned in CA3314611689619930509 (1993)
+pts <- pts %>%
+  filter(!fire_id == "CA3320411691620031026")
+
+### drop associated inner line
+lines_fires <- lines_fires %>%
+  filter(!Event_ID == "CA3320411691620031026")
+
+### set up parallels
+plan(multisession, workers = 15)
+
+### split into chunks
+pts_chunks <- split(pts,
+                   sort(rank(1:nrow(pts)) %% future::nbrOfWorkers()))
+
+### function for each chunk
+process_chunk <- function(pts_chunk) {
+  
+  ### function for each worker
+  get_dist_df <- function(pt_i) {
+    line_i <- lines_fires %>%
+      filter(Event_ID %in% pt_i$fire_id)
+
+    if (nrow(line_i) == 0) {
+      return(data.frame(uid = pt_i$uid, dist_bound = NA_real_))
+    }
+
+    dist_i <- st_distance(pt_i, line_i)
+
+    return(data.frame(uid = pt_i$uid, dist_bound = as.numeric(dist_i)))
+  }
+
+  ### apply function to each row in each chunk
+  results <- lapply(1:nrow(pts_chunk), function(i) {
+    get_dist_df(pts_chunk[i, ])
+  })
+
+  ### combine results from this chunk
+  do.call(rbind, results)
+}
+
+### run function on each chunk in parallel
+dist_list <- future_lapply(pts_chunks, process_chunk)
+
+### combine all chunks into final data frame
+dist_df <- do.call(rbind, dist_list)
+
+### save
+write_csv(dist_df,
+         "~/data-store/data/iplant/home/kjsiegel/fuel_treat/esa/pts_dist.csv")
+```
+
+#### clean up distances
+```{r}
+### open cyverse output
+pts_dist <- read.csv("E:/fuel_treat/covars/pts_dist.csv")
+
+### drop dups
+pts_dist <- distinct(pts_dist)
+
+### keep minimum distance (7528390)
+pts_dist <- pts_dist %>%
+  arrange(dist_bound) %>%
+  group_by(uid) %>%
+  slice_min(order_by = dist_bound, n = 1) %>%
+  ungroup()
+
+### write out
+write_csv(pts_dist, "E:/fuel_treat/covars/pts_dist_min.csv")
+
+### combine with pts attributes
+pts_att <- merge(x = pts,
+                 y = pts_dist,
+                 by = "uid",
+                 all.x = TRUE)
+
+### check out NA distances
+dist_na <- pts_att %>%
+  filter(is.na(dist_bound))
+
+### write out missing distances
+st_write(dist_na,
+         "E:/fuel_treat/esa_dist_missing.shp")
+
+### write out distances we have
+st_write(pts_att,
+         "E:/fuel_treat/covars/esa_pts_dist_min.shp")
+
+test <- pts_att %>% filter(fire_id == "WA4624311735619970811")
+st_write(test,
+         "E:/fuel_treat/covars/esa_pts_dist_min_test.shp")
+```
+
+##### understand missing distances
+```{r}
+### open pts with missing distances
+dist_na <- st_read("E:/fuel_treat/esa_dist_missing.shp")
+
+##### need to harmonize fires and then re-run
+### 128668 in pretty much entirely inside OR4530512138720070712 and ignition date within 2 days of each other. distances ran for 128668 but not for OR4530512138720070712 -- need to run for OR4530512138720070712
+### 2091 contained by CA4095112320220060902 and occurred after --> drop 2091 and re-do boundaries for the treatment, then recalculate distances
+### 136922 mostly contained by ID4355611124820160823 with ignition date within about 4 days. Distance points ran for 136922 but not ID4355611124820160823
+
+##### need to re-run for part of fire (because combined adjacent fires)
+### 115264: ft contained by fire, part of fire didn't calculate distances --> re-run  [diff fires/fts]
+### part of 146803 is missing distance for points [diff fires/fts]
+### part of 96707 is missing distance for points [diff fires/fts]
+### part of 96707 is missing distance for points [diff fires/fts]
+### part of 146388 is missing distance for points [diff fires/fts]
+### part of 172929 is missing distance for points [diff fires/fts]
+### part of 130719 missing [diff fires/fts]
+### 171512 missing distance for some pts [diff fires/fts]
+### 170789 missing distance for some pts [diff fires/fts]
+### 172929 missing distance for some pts [diff fires/fts]
+
+##### to drop
+### 142201 completely contained by ft -- drop
+### 142599 completely contained by ft -- drop
+### 142757 completely contained by ft -- drop
+### 142755 completely contained by ft -- drop
+### 13333 contained by ft -- drop
+### 13011 contained by ft -- drop
+### 147525 contained by ft -- drop
+### 138225 contained by ft -- drop
+### 138297 contained by ft -- drop
+### 137074 contained by ft -- drop
+### 130782 (3/31/2021) contained by ft -- drop
+### 130798 (8/20/2006) contained by ft -- drop
+### 130497 contained by ft -- drop
+### 130228 contained by ft -- drop
+### 129984 contained by ft -- drop
+### 128885 contained by ft -- drop
+### 129087 contained by ft -- drop
+### 129127 contained by ft -- drop
+### 128297 contained by ft -- drop
+### 176951 contained by ft -- drop
+### 2823 mostly contained by CA4045212284620080621 and ignition date within a few weeks -- drop 2823
+### 13403 mostly inside AZ3449111148820150606 and ignition date within 8 days -- drop 13403
+### 138570 didn't really burn (MODIS corners) -- drop
+### 174804 mostly contained by ID4663111491320120822 and ignition date 13 days apart -- drop 174804
+### CA3314611689619930509 in 1993 and CA3320411691620031026 in 2003. CA3314611689619930509 burned part of ft but not all. drop CA3320411691620031026 because complication of reburn
+
+```
+
+##### fix missing distances
+```{r}
+### open sample points
+pts <- st_read("E:/fuel_treat/esa_subset/esa_sample_pts_simp.shp")
+
+### open inner lines
+lines_fires <- st_read("E:/fuel_treat/esa_subset/ft_boundaries/inner_lines.shp")
+
+### drop fires identified before
+pts <- pts %>%
+  filter(!fire_id %in% c("142201", "142599", "142757", "142755", "13333",
+                         "13011", "147525", "138225", "138297", "137074",
+                         "130782", "130798", "130497", "130228", "129984",
+                         "128885", "129087", "129127", "128297", "176951",
+                         "2823", "13403", "138570", "174804", "CA3320411691620031026"))
+```
+
+###### fires that need to be harmonized
+```{r}
+### 128668 in pretty much entirely inside OR4530512138720070712 and ignition date within 2 days of each other. distances ran for 128668 but not for OR4530512138720070712 -- need to run for OR4530512138720070712
+oreg_453_pts <- pts %>% filter(fire_id == "OR4530512138720070712")
+
+### subset lines_fires
+line_oreg_453 <- lines_fires %>% 
+  filter(Event_ID == "128668") %>%
+  filter(line_id == 38)
+
+### distance function
+get_dist_df <- function(pt_i) {
+  dist_i <- st_distance(pt_i, line_oreg_453)
+  return(data.frame(uid = pt_i$uid, dist_bound = as.numeric(dist_i)))
+}
+
+### apply function to each row in each chunk
+results <- lapply(1:nrow(oreg_453_pts), function(i) {
+  get_dist_df(oreg_453_pts[i, ])
+})
+
+### combine results from this chunk
+results_df_oreg_453 <- do.call(rbind, results)
+
+### 136922 mostly contained by ID4355611124820160823 with ignition date within about 4 days. Distance points ran for 136922 but not ID4355611124820160823
+idah_435_pts <- pts %>% filter(fire_id == "ID4355611124820160823")
+
+### subset lines_fires
+line_idah_435 <- lines_fires %>% 
+  filter(Event_ID == "136922") %>%
+  filter(line_id == 132)
+
+### distance function
+get_dist_df <- function(pt_i) {
+  dist_i <- st_distance(pt_i, line_idah_435)
+  return(data.frame(uid = pt_i$uid, dist_bound = as.numeric(dist_i)))
+}
+
+### apply function to each row in each chunk
+results <- lapply(1:nrow(idah_435_pts), function(i) {
+  get_dist_df(idah_435_pts[i, ])
+})
+
+### combine results from this chunk
+results_df_idah_435 <- do.call(rbind, results)
+
+### 2091 contained by CA4095112320220060902 and occurred after --> drop 2091 and re-do boundaries for the treatment, then recalculate distances
+cali_409_pts <- pts %>% filter(fire_id == "CA4095112320220060902")
+
+# st_write(cali_409_pts,
+#          "E:/fuel_treat/esa_subset/ft_boundaries/cali_409_pts_new.shp")
+
+### open cali results from cyverse
+cali_409_pts <- read.csv("E:/fuel_treat/covars/dist_cali_409.csv")
+
+### open pts dist
+pts_dist <- read.csv("E:/fuel_treat/covars/pts_dist_min.csv")
+
+### combine
+rerun_fires <- rbind(cali_409_pts,
+                     results_df_idah_435,
+                     results_df_oreg_453)
+
+### drop those fires from pts
+pts_dist <- pts_dist %>%
+  filter(!uid %in% rerun_fires$uid)
+
+### combine
+pts_dist <- rbind(pts_dist, 
+                  rerun_fires)
+
+### write out
+write_csv(pts_dist, 
+          "E:/fuel_treat/covars/pts_dist_min_fix.csv")
+
+# ### open fires and fts
+# fires <- st_read("E:/fuel_treat/esa_subset/esa_fires_simp.shp") %>%
+#   filter(., Event_ID == "CA4095112320220060902")
+# fts <- st_read("E:/fuel_treat/esa_subset/esa_fts.shp") %>%
+#   filter(., Event_ID == "CA4095112320220060902")
+# 
+# # ggplot() +
+# #   geom_sf(data = fires, color = "blue", fill = "lightblue") +
+# #   geom_sf(data = fts, color = "red")
+# 
+# ### set precision and make valid
+# fts <- st_set_precision(fts, 1e6) %>% st_make_valid()
+# fires <- st_set_precision(fires, 1e6) %>% st_make_valid()
+# 
+# ### output list
+# boundary_polys <- list()
+# 
+# ### loop through each feature in fts
+# for (i in 1:nrow(fts)) {
+#   cat("Processing row", i, "\n") 
+#   
+#   polygon_i <- fts[i, ]
+#   
+#   contained <- st_within(polygon_i, fires, sparse = FALSE)
+#   
+#   if (!FALSE %in% contained) {
+#     
+#     ### fully contained in fire — just keep the polygon itself
+#     polygon_i <- polygon_i %>%
+#       dplyr::select(geometry)
+#     
+#     if (!is.null(polygon_i) && nrow(polygon_i) > 0 && !all(st_is_empty(polygon_i))) {
+#       boundary_polys[[i]] <- polygon_i
+#     }
+#     
+#   } else {
+#     
+#     ### fire without this ft
+#     no_intersect_i <- rmapshaper::ms_erase(fires, fts[i, ])
+#     
+#     ### portion of ft inside fire
+#     use_ft_crop_i <- st_intersection(fts[i, ], fires)
+#     
+#     ### clean geometries
+#     no_intersect_i <- no_intersect_i %>%
+#       dplyr::select(Event_ID, geometry) %>%
+#       st_make_valid() %>%
+#       st_buffer(0)
+#     
+#     use_ft_crop_i <- use_ft_crop_i %>%
+#       dplyr::select(Event_ID = poly_id, geometry) %>%
+#       st_make_valid() %>%
+#       st_buffer(0)
+#     
+#     ### combine and dissolve
+#     comb_sf <- rbind(no_intersect_i, use_ft_crop_i) %>%
+#       st_make_valid() %>%
+#       st_buffer(0) %>%
+#       st_set_precision(1e6)
+#     
+#     comb_sf_union <- comb_sf %>%
+#       group_by(Event_ID) %>%
+#       summarise(geometry = st_union(geometry)) %>%
+#       ungroup() %>%
+#       st_make_valid()
+#     
+#     ### create inner lines
+#     inner_line <- try(ms_innerlines(comb_sf_union) %>% st_as_sf(), silent = TRUE)
+#     
+#     if (!inherits(inner_line, "try-error") && !is.null(inner_line) &&
+#         nrow(inner_line) > 0 && !all(st_is_empty(inner_line))) {
+#       boundary_polys[[i]] <- inner_line
+#     }
+#     
+#     ### check if fire is fully inside ft
+#     fully_contained <- st_within(fires, fts[i, ], sparse = FALSE)
+#     
+#     if (all(fully_contained)) {
+#       fully_contained_inner_line <- st_difference(fts[i, ], fires)
+#       
+#       if (!st_is_empty(fully_contained_inner_line)) {
+#         if (inherits(st_geometry(fully_contained_inner_line), "sfc_LINESTRING")) {
+#           fully_contained_inner_line <- st_cast(fully_contained_inner_line, "MULTILINESTRING")
+#         }
+#         
+#         if (inherits(st_geometry(fully_contained_inner_line), "sfc_MULTILINESTRING")) {
+#           fully_contained_inner_line <- st_line_merge(fully_contained_inner_line)
+#         }
+#         
+#         if (!is.null(fully_contained_inner_line) && !all(st_is_empty(fully_contained_inner_line))) {
+#           boundary_polys[[i]] <- fully_contained_inner_line
+#         }
+#       }
+#     }
+#   }
+# }
+# 
+# ### remove null or empty entries
+# boundary_polys_clean <- boundary_polys[!sapply(boundary_polys, function(x) {
+#   is.null(x) || inherits(x, "try-error") || nrow(x) == 0 || all(st_is_empty(x))
+# })]
+# 
+# ### combine into sf
+# result_lines <- do.call(rbind, boundary_polys_clean) %>% st_make_valid()
+# 
+# ### add cols
+# result_lines <- result_lines %>%
+#   mutate(line_id = NA,
+#          Event_ID = NA)
+# result_lines$line_id <- "399"
+# result_lines$Event_ID <- "CA4095112320220060902"
+# result_lines <- result_lines %>%
+#   dplyr::select(line_id, Event_ID, geometry)
+# 
+# ### combine with the rest of the inner lines
+# lines_fires <- rbind(lines_fires, result_lines)
+# 
+# ### write out
+# st_write(lines_fires,
+#          "E:/fuel_treat/esa_subset/ft_boundaries/inner_lines.shp",
+#          append = FALSE)
+
+### subset lines
+line_cali_409 <- lines_fires %>% 
+  filter(Event_ID == "CA4095112320220060902") %>%
+  filter(line_id == "399")
+
+### distance function
+get_dist_df <- function(pt_i) {
+  dist_i <- st_distance(pt_i, result_lines)
+  return(data.frame(uid = pt_i$uid, dist_bound = as.numeric(dist_i)))
+}
+
+### parallelize
+plan(multisession, workers = 5)
+
+chunk_size <- 1000
+n_chunks <- ceiling(nrow(cali_409_pts) / chunk_size)
+
+for (k in 1:n_chunks) {
+  idx <- ((k - 1) * chunk_size + 1):min(k * chunk_size, nrow(cali_409_pts))
+  chunk <- cali_409_pts[idx, ]
+  
+  chunk_result <- future_lapply(1:nrow(chunk), function(i) {
+    get_dist_df(chunk[i, ])
+  })
+
+  chunk_df <- data.table::rbindlist(chunk_result)
+  data.table::fwrite(chunk_df, paste0("results_chunk_", k, ".csv"))
+}
+
+# ### apply function to each row in each chunk
+# results <- future_lapply(1:nrow(cali_409_pts), function(i) {
+#   get_dist_df(cali_409_pts[i, ])
+# })
+# 
+# ### combine results from this chunk
+# results_df_cali_409 <- do.call(rbind, results)
+
+```
+###### fires to re-run
+Fires where part of the fire didn't run -- likely because I combined adjacent fires and something got messed up with the fire_id in the inner_lines sjp
+```{r}
+##### need to re-run for part of fire (because combined adjacent fires)
+### 115264: ft contained by fire, part of fire didn't calculate distances --> re-run  [diff fires/fts]
+### part of 146803 is missing distance for points [diff fires/fts]
+### part of 96707 is missing distance for points [diff fires/fts]
+### part of 146388 is missing distance for points [diff fires/fts]
+### part of 172929 is missing distance for points [diff fires/fts]
+### part of 130719 missing [diff fires/fts]
+### 171512 missing distance for some pts [diff fires/fts]
+### 170789 missing distance for some pts [diff fires/fts]
+
+### open inner lines
+lines_fires <- st_read("E:/fuel_treat/esa_subset/ft_boundaries/inner_lines.shp")
+
+### open sample points
+pts <- st_read("E:/fuel_treat/esa_subset/esa_sample_pts_simp.shp") %>%
+  filter(., fire_id %in% c("115264", "146803", "96707", "146388",
+                           "172929", "130719", "171512", "170789"))
+
+### get nearest feature
+nearest_line <- st_nearest_feature(pts, lines_fires)
+
+# Extract the nearest line geometries or rows
+nearest_line <- lines_fires[nearest_line, ]
+
+### drop geom
+st_geometry(nearest_line) <- NULL
+
+### add to points
+pts_lines <- cbind(pts, nearest_line)
+
+### set up parallels
+plan(multisession, workers = 8)
+
+### split into chunks
+pts_chunks <- split(pts_lines,
+                   sort(rank(1:nrow(pts_lines)) %% future::nbrOfWorkers()))
+
+### function for each chunk
+process_chunk <- function(pts_chunk) {
+  
+  ### function for each worker
+  get_dist_df <- function(pt_i) {
+    line_i <- lines_fires %>%
+      filter(line_id %in% pt_i$line_id)
+
+    if (nrow(line_i) == 0) {
+      return(data.frame(uid = pt_i$uid, dist_bound = NA_real_))
+    }
+
+    dist_i <- st_distance(pt_i, line_i)
+
+    return(data.frame(uid = pt_i$uid, dist_bound = as.numeric(dist_i)))
+  }
+
+  ### apply function to each row in each chunk
+  results <- lapply(1:nrow(pts_chunk), function(i) {
+    get_dist_df(pts_chunk[i, ])
+  })
+
+  ### combine results from this chunk
+  do.call(rbind, results)
+}
+
+### run function on each chunk in parallel
+dist_list <- future_lapply(pts_chunks, process_chunk)
+
+### combine all chunks into final data frame
+dist_df <- do.call(rbind, dist_list)
+
+### open the other fixed pts
+pts_dist <- read.csv("E:/fuel_treat/covars/pts_dist_min_fix.csv")
+
+### drop fixed uids
+pts_dist <- pts_dist %>%
+  filter(!uid %in% dist_df$uid)
+
+### combine
+dist_all <- rbind(pts_dist, dist_df)
+
+### save
+write_csv(dist_all,
+         "E:/fuel_treat/covars/pts_dist_min_fix_full.csv")
+```
+
+## Points on ft boundaries
+Don't want to include points whose pixels straddle the boundaries
+```{r}
+### open distance from pts to nearest boundary file
+dist_bound <- read_csv("E:/fuel_treat/covars/pts_dist_min_fix_full.csv")
+
+### subset to pts that are close to the nearest boundary, as these are the points likely to be on the boundary. Since each pixel is 30 x 30, the furthest a point could be from the boundary and still be inside the pixel that's crossed by the boundary is sqrt(1800). Use a slightly bigger number just for wiggle room
+dist_bound <- dist_bound %>%
+  filter(dist_bound < 60)
+
+### open pts shp and restrict to pts close to boundary
+pts <- st_read("E:/fuel_treat/esa_subset/esa_sample_pts_simp.shp") %>%
+  filter(.,
+         uid %in% dist_bound$uid)
+
+### convert pts to squares
+pts <- pts %>%
+  st_buffer(dist = 15,
+            endCapStyle = "SQUARE")
+
+### open boundaries
+lines_fires <- st_read("E:/fuel_treat/esa_subset/ft_boundaries/inner_lines.shp") %>%
+  mutate(., poly_id = row_number())
+
+### check for overlaps
+overlap_pts <- st_intersection(pts, lines_fires)
+
+### drop geom
+st_geometry(overlap_pts) <- NULL
+
+### column for overlap
+overlap_pts <- overlap_pts %>%
+  mutate(overlap_bound = "overlap") %>%
+  dplyr::select(uid, overlap_bound) %>%
+  distinct()
+
+### open full pts shp 
+pts <- st_read("E:/fuel_treat/esa_subset/esa_sample_pts_simp.shp") 
+
+### drop geom
+st_geometry(pts) <- NULL
+
+### merge
+pts <- merge(x = pts,
+             y = overlap_pts,
+             by = "uid",
+             all.x = TRUE)
+
+### change NAs
+pts$overlap_bound[is.na(pts$overlap_bound)] <- "nonoverlap"
+
+### write out
+write_csv(pts,
+          "E:/fuel_treat/esa_subset/pts_overlap_status.csv")
+```
+
+## Points on fire boundaries
+Don't want to include points whose pixels straddle the fire boundary
+```{r}
+### open pts shp and restrict to pts close to boundary
+pts <- st_read("E:/fuel_treat/esa_subset/esa_sample_pts_simp.shp") 
+
+### convert pts to squares
+pts <- pts %>%
+  st_buffer(dist = 15,
+            endCapStyle = "SQUARE")
+
+### get fires
+mt <- st_read("E:/fuel_treat/esa_subset/esa_fires_simp_fix.shp") %>%
+  filter(., Event_ID %in% pts$fire_id)
+
+### output
+outer_bound <- list()
+
+### loop
+for (i in 1:nrow(mt)) {
+  
+  ### get fire
+  temp_fire <- mt[i, ]
+  
+  ### get pts
+  temp_pts <- pts %>%
+    filter(fire_id %in% temp_fire)
+  
+  ### get overlap
+  temp_over <- st_intersection(temp_pts, temp_fire)
+  
+  ### store
+  outer_bound[[i]] <- temp_over
+  
+  ### clean 
+  rm(temp_pts, temp_over)
+  gc()
+  
+}
+
+### combine
+outer_bound_pts <- do.call(rbind, outer_bound)
+
+### calculate area
+outer_bound_pts$pix_area <- st_area(outer_bound_pts)
+
+### drop pts whose pixels are not fully contained
+full_pix <- outer_bound_pts %>%
+  mutate(pix_area = as.numeric(pix_area)) %>%
+  filter(pix_area > 899.999999999)
+
+### drop geom
+st_geometry(full_pix) <- NULL
+
+### clean
+rm(outer_bound, outer_bound_pts)
+gc()
+
+### simplify full_pix for merge
+full_pix <- full_pix %>%
+  dplyr::select(uid, pix_area) %>%
+  mutate(in_fire = "inside")
+
+### drop pts geom
+st_geometry(pts) <- NULL
+
+### merge with full pts
+pts <- merge(x = pts,
+             y = full_pix,
+             by = "uid",
+             all.x = TRUE)
+
+### change NAs
+pts$in_fire[is.na(pts$in_fire)] <- "not_inside"
+
+### simplify
+pts <- pts %>%
+  dplyr::select(uid, in_fire)
+
+### write out
+write_csv(pts,
+          "E:/fuel_treat/esa_subset/pts_within_fire_status.csv")
+
+# check <- bound_polys_all %>% filter(poly_id %in% c(14, 15, 16))
+# check_pts <- pts %>% filter(uid == "ID4485611430720180802_212424")
+# ggplot() + geom_sf(data = check) + geom_sf(data = check_pts, color = "red", fill = NA)
+```
+
+### Combine pt boundary info
+```{r}
+### open pts on ft boundaries
+ft_pts <- read.csv("E:/fuel_treat/esa_subset/pts_overlap_status.csv")
+
+### open pts on fire boundaries
+fire_pts <- read.csv("E:/fuel_treat/esa_subset/pts_within_fire_status.csv")
+
+### combine
+ft_fire <- merge(x = ft_pts,
+                 y = fire_pts,
+                 by = "uid",
+                 all = TRUE)
+
+### clean up
+rm(ft_pts, fire_pts)
+gc()
+
+### open pts shp
+pts <- st_read("E:/fuel_treat/esa_subset/esa_sample_pts_simp.shp")
+
+### simplify ft_fire
+ft_fire <- ft_fire %>%
+  dplyr::select(uid, overlap_bound, in_fire)
+
+### merge with pts
+pt_status <- merge(x = pts,
+                   y = ft_fire,
+                   by = "uid",
+                   all = TRUE)
+
+### write out
+st_write(pt_status,
+         "E:/fuel_treat/esa_subset/pt_status.shp")
+st_write(pt_status,
+         "E:/fuel_treat/esa_subset/pt_status.gpkg")
+```
+#### subset for terraclimate
+only run climate extraction for pts that aren't on boundaries
+```{r}
+### restrict pts -- drop pts on ft-fire boundary and fire boundary
+pt_keep <- pt_status %>%
+  filter(overlap_bound == "nonoverlap") %>%
+  filter(in_fire == "inside")
+### drops ~200,000 pts
+
+### write out
+st_write(pt_keep,
+         "E:/fuel_treat/esa_subset/pt_gee.shp")
+
+
+### what I need for GEE
+# uid = unique identifier for each sample point
+# fire_yr = year fire burned (the same for all points in a given fire)
+# Ig_Date = date fire began (the same for all points in a given fire)
+# dt_brnd = the date each individual pixel burned
+
+### open 
+pt_keep <- st_read("E:/fuel_treat/esa_subset/pt_gee.shp")
+
+### simplify cols for GEE
+pt_keep <- pt_keep %>%
+  dplyr::select(uid, 
+                fire_yr,
+                Ig_Date = ig_date, 
+                geometry)
+
+### try with just fires before 2001
+test <- pt_keep %>% filter(fire_yr < 2001)
+### write out
+st_write(test,
+         "E:/fuel_treat/esa_subset/pt_gee_1.shp")
+
+### fires from 2000-2005
+test_pt_keep <- pt_keep %>%
+  filter(fire_yr > 2000 & fire_yr < 2006)
+st_write(test_pt_keep,
+         "E:/fuel_treat/esa_subset/pt_gee_2.shp")
+
+### fires from 2006, ignition date 2006-09-02
+test_pt_keep <- pt_keep %>%
+  filter(fire_yr == 2006 & Ig_Date == "2006-09-02")
+st_write(test_pt_keep,
+         "E:/fuel_treat/esa_subset/pt_gee_3.shp")
+
+### fires from 2006, ignition date NOT 2006-09-02
+test_pt_keep <- pt_keep %>%
+  filter(fire_yr == 2006) %>%
+  filter(!Ig_Date == "2006-09-02")
+st_write(test_pt_keep,
+         "E:/fuel_treat/esa_subset/pt_gee_4.shp")
+
+### fires from 2007-2010
+test_pt_keep <- pt_keep %>%
+  filter(fire_yr > 2006 & fire_yr < 2011)
+st_write(test_pt_keep,
+         "E:/fuel_treat/esa_subset/pt_gee_5.shp")
+
+### fires from 2011-2015
+test_pt_keep <- pt_keep %>%
+  filter(fire_yr > 2010 & fire_yr < 2016)
+st_write(test_pt_keep,
+         "E:/fuel_treat/esa_subset/pt_gee_6.shp")
+
+### after 2015
+test_pt_keep <- pt_keep %>%
+  filter(fire_yr > 2015)
+st_write(test_pt_keep,
+         "E:/fuel_treat/esa_subset/pt_gee_7.shp")
+```
+
+
 ## Covariates
 ### topography
 #### TPI
@@ -6930,6 +7679,590 @@ write_csv(evi_files, "E:/fuel_treat/covars/evi.csv")
 ```
 
 ## Climate 
+chunks that failed to export in GEE (Error: Computed value is too large. (Error code: 3)):
+- pts_3 chunk 3, chunk 4
+- pts_7 chunk 1, 2, 5
+### figure out which ones are missing from GEE
+```{r}
+############################
+### chunk 3
+############################
+### open original chunks
+pts_3 <- st_read("E:/fuel_treat/esa_subset/pt_gee_3.shp")
+
+### get file list for 3
+pts_3_files <- list.files(path = "E:/fuel_treat/covars/terraclimate",
+                        pattern = "^TerraClimateExtracted_3_.*\\.csv$",
+                        full.names = TRUE)
+
+### open them
+pts_3_files <- lapply(pts_3_files, read.csv)
+
+### combine
+pts_3_files <- do.call("rbind", pts_3_files)
+
+### get pts that are still missing
+pts_3_still <- pts_3 %>%
+  filter(!uid %in% pts_3_files$uid)
+
+### write them out
+st_write(pts_3_still,
+         "E:/fuel_treat/esa_subset/pt_gee_8.shp")
+
+### clean up
+rm(pts_3, pts_3_files, pts_3_still)
+gc()
+
+############################
+### chunk 7
+############################
+### open original chunks
+pts_7 <- st_read("E:/fuel_treat/esa_subset/pt_gee_7.shp")
+
+### get file list for 3
+pts_7_files <- list.files(path = "E:/fuel_treat/covars/terraclimate",
+                        pattern = "^TerraClimateExtracted_7_.*\\.csv$",
+                        full.names = TRUE)
+
+### open them
+pts_7_files <- lapply(pts_7_files, read.csv)
+
+### combine
+pts_7_files <- do.call("rbind", pts_7_files)
+
+### get pts that are still missing
+pts_7_still <- pts_7 %>%
+  filter(!uid %in% pts_7_files$uid)
+
+### write them out
+st_write(pts_7_still,
+         "E:/fuel_treat/esa_subset/pt_gee_9.shp")
+
+### clean up
+rm(pts_3, pts_3_files, pts_3_still)
+gc()
+```
+
+#### notes from Steve:
+allclimatedata.csv
+
+Contains a row for each provided sample points (rows), and columns for weather data from terraclimate and gridmet
+
+Columns:
+- uid: the unique point id from the original provided sample points
+- XXXX_lag_Y: terraclimate variable XXXX at month lag Y, based on the burn date for the sample point. lag 0 is the month containing the burn date in the original sample point asset, lag 11 is 11 months prior (so we have 12 months total).
+- remaining columns are the requested bands from gridmet on the burn date for the sample point.
+
+Note on units:
+Values are extracted directly from the Earth Engine assets and are not transformed to be in comparable units across data sources. 
+Given that the units are different, these will need to be transformed before use/comparison. For example, terraclimate has temperatures
+in units of 0.1 degrees C (e.g., a value of 254 is 25.4C), while gridmet has temps in deg K.
+
+Links to info on band units
+- https://developers.google.com/earth-engine/datasets/catalog/IDAHO_EPSCOR_TERRACLIMATE#bands
+- https://developers.google.com/earth-engine/datasets/catalog/IDAHO_EPSCOR_GRIDMET#bands
+
+Note on invalid sample points in original asset: some of the sample points in the original asset file (25,755) appeared to have a null burn date and so were dropped, as the absence of a burn date precluded proper selection of weather assets.
+#### steve's code to merge chunks
+```{r}
+### function to load files
+load_dir_files = function(dir) {
+  return(rbindlist(
+           lapply(list.files(dir), 
+                  FUN=function(f) {
+                     return(fread(paste0(dir, f)))
+                  }
+           )
+        )
+  )
+}
+
+### open all terraclimate data
+all_tc <- load_dir_files("E:/fuel_treat/covars/terraclimate/")
+
+### write out
+fwrite(all_tc, "E:/fuel_treat/covars/terraclimate.csv")
+```
+#### climate summaries
+```{r}
+### open pts
+pts_all <- st_read("E:/fuel_treat/esa_subset/esa_sample_pts_simp.shp")
+
+### get ig_date
+st_geometry(pts_all) <- NULL
+pts_all <- pts_all %>%
+  dplyr::select(uid, ig_date, year = fire_year) %>%
+  mutate(month = month(ig_date))
+
+### open tc data
+all_tc <- read.csv("E:/fuel_treat/covars/terraclimate.csv")
+
+### merge 
+pts_tc <- merge(x = pts_all,
+                y = all_tc,
+                by = "uid",
+                all = TRUE)
+
+### clean up
+rm(all_tc, pts_all)
+
+### range of ignition months
+table(pts_tc$month)
+# 1       3       4       5       6       7       8       9      10      11      12 
+# 351    3965   15420  297325  787817 1094961 1819105  767972  566516    9852     758 
+
+###################################################
+### work with january fires
+pts_tc_jan <- pts_tc %>%
+  filter(month < 2)
+
+### lag_0 = jan
+### lag_1 = dec
+### lag_2 = nov
+### lag_3 = oct
+### lag_4 = sep
+### lag_5 = aug
+### lag_6 = jul
+### lag_7 = jun
+### lag_8 = may
+### lag_9 = apr
+### lag_10 = mar
+### lag_11 = feb
+
+### make long
+pts_tc_jan_long <- pts_tc_jan %>%
+  pivot_longer(cols = -c(uid, ig_date, year, month),
+               names_to = "metric",
+               values_to = "value")
+
+### separate lag, add column for season
+pts_tc_jan_long <- pts_tc_jan_long %>%
+  separate(metric, into = c("metric_name", "lag", "lag_number"),  
+    sep = "_", extra = "merge", fill = "right") %>%
+  dplyr::select(-lag) %>%
+  mutate(season = ifelse(lag_number %in% c("0", "1"), "winter",
+                         ifelse(lag_number %in% c("2", "3", "4"), "fall",
+                                ifelse(lag_number %in% c("5", "6", "7"), "summer",
+                                       ifelse(lag_number %in% c("8", "9", "10"),
+                                              "spring", "misc")))))
+
+### get seasonal metrics
+pts_tc_jan_summ <- pts_tc_jan_long %>%
+  group_by(uid, ig_date, year, month, metric_name, season) %>%
+  summarise(max_seasonal_value = if (all(is.na(value))) NA_real_ else max(value, na.rm = TRUE),
+            mean_seasonal_value = if (all(is.na(value))) NA_real_ else mean(value, na.rm = TRUE),
+            total_seasonal_value = if (all(is.na(value))) NA_real_ else sum(value, na.rm = TRUE))
+
+rm(pts_tc_jan, pts_tc_jan_long)
+gc()
+
+### write out
+write_csv(pts_tc_jan_summ, "E:/fuel_treat/covars/terraclimate/tc_month/terraclimate_jan.csv")
+
+rm(pts_tc_jan_summ)
+gc()
+
+###################################################
+### work with march fires
+pts_tc_mar <- pts_tc %>%
+  filter(month == 3)
+
+### lag_0 = mar
+### lag_1 = feb
+### lag_2 = jan
+### lag_3 = dec
+### lag_4 = nov
+### lag_5 = oct
+### lag_6 = sep
+### lag_7 = aug
+### lag_8 = jul
+### lag_9 = jun
+### lag_10 = may
+### lag_11 = apr
+
+### make long
+pts_tc_mar_long <- pts_tc_mar %>%
+  pivot_longer(cols = -c(uid, ig_date, year, month),
+               names_to = "metric",
+               values_to = "value")
+
+### separate lag, add column for season
+pts_tc_mar_long <- pts_tc_mar_long %>%
+  separate(metric, into = c("metric_name", "lag", "lag_number"),  
+    sep = "_", extra = "merge", fill = "right") %>%
+  dplyr::select(-lag) %>%
+  mutate(season = ifelse(lag_number %in% c("1", "2", "3"), "winter",
+                         ifelse(lag_number %in% c("4", "5", "6"), "fall",
+                                ifelse(lag_number %in% c("7", "8", "9"), "summer",
+                                       ifelse(lag_number %in% c("10", "11"),
+                                              "spring", "misc")))))
+
+### get seasonal metrics
+pts_tc_mar_summ <- pts_tc_mar_long %>%
+  group_by(uid, ig_date, year, month, metric_name, season) %>%
+  summarise(max_seasonal_value = if (all(is.na(value))) NA_real_ else max(value, na.rm = TRUE),
+            mean_seasonal_value = if (all(is.na(value))) NA_real_ else mean(value, na.rm = TRUE),
+            total_seasonal_value = if (all(is.na(value))) NA_real_ else sum(value, na.rm = TRUE))
+
+### write out
+write_csv(pts_tc_mar_summ, "E:/fuel_treat/covars/terraclimate/tc_month/terraclimate_mar.csv")
+
+rm(pts_tc_mar, pts_tc_mar_long, pts_tc_mar_summ)
+gc()
+
+###################################################
+### work with april fires
+pts_tc_apr <- pts_tc %>%
+  filter(month == 4)
+
+### lag_0 = apr
+### lag_1 = mar
+### lag_2 = fed
+### lag_3 = jan
+### lag_4 = dec
+### lag_5 = nov
+### lag_6 = oct
+### lag_7 = sep
+### lag_8 = aug
+### lag_9 = jul
+### lag_10 = jun
+### lag_11 = may
+
+### make long
+pts_tc_apr_long <- pts_tc_apr %>%
+  pivot_longer(cols = -c(uid, ig_date, year, month),
+               names_to = "metric",
+               values_to = "value")
+
+### separate lag, add column for season
+pts_tc_apr_long <- pts_tc_apr_long %>%
+  separate(metric, into = c("metric_name", "lag", "lag_number"),  
+    sep = "_", extra = "merge", fill = "right") %>%
+  dplyr::select(-lag) %>%
+  mutate(season = ifelse(lag_number %in% c("0", "1"), "spring",
+                         ifelse(lag_number %in% c("2", "3", "4"), "winter",
+                                ifelse(lag_number %in% c("5", "6", "7"), "fall",
+                                       ifelse(lag_number %in% c("8", "9", "10"),
+                                              "summer", "misc")))))
+
+### get seasonal metrics
+pts_tc_apr_summ <- pts_tc_apr_long %>%
+  group_by(uid, ig_date, year, month, metric_name, season) %>%
+  summarise(max_seasonal_value = if (all(is.na(value))) NA_real_ else max(value, na.rm = TRUE),
+            mean_seasonal_value = if (all(is.na(value))) NA_real_ else mean(value, na.rm = TRUE),
+            total_seasonal_value = if (all(is.na(value))) NA_real_ else sum(value, na.rm = TRUE))
+
+write_csv(pts_tc_apr_summ, "E:/fuel_treat/covars/terraclimate/tc_month/terraclimate_apr.csv")
+
+rm(pts_tc_apr, pts_tc_apr_long, pts_tc_apr_summ)
+gc()
+
+###################################################
+### work with may fires
+pts_tc_may <- pts_tc %>%
+  filter(month == 5)
+
+### lag_0 = may
+### lag_1 = apr
+### lag_2 = mar
+### lag_3 = fed
+### lag_4 = jan
+### lag_5 = dec
+### lag_6 = nov
+### lag_7 = oct
+### lag_8 = sep
+### lag_9 = aug
+### lag_10 = jul
+### lag_11 = jun
+
+### make long
+pts_tc_may_long <- pts_tc_may %>%
+  pivot_longer(cols = -c(uid, ig_date, year, month),
+               names_to = "metric",
+               values_to = "value")
+
+### separate lag, add column for season
+pts_tc_may_long <- pts_tc_may_long %>%
+  separate(metric, into = c("metric_name", "lag", "lag_number"),  
+    sep = "_", extra = "merge", fill = "right") %>%
+  dplyr::select(-lag) %>%
+  mutate(season = ifelse(lag_number %in% c("0", "1", "2"), "spring",
+                         ifelse(lag_number %in% c("3", "4", "5"), "winter",
+                                ifelse(lag_number %in% c("6", "7", "8"), "fall",
+                                       ifelse(lag_number %in% c("9", "10", "11"),
+                                              "summer", "misc")))))
+
+### get seasonal metrics
+pts_tc_may_summ <- pts_tc_may_long %>%
+  group_by(uid, ig_date, year, month, metric_name, season) %>%
+  summarise(max_seasonal_value = if (all(is.na(value))) NA_real_ else max(value, na.rm = TRUE),
+            mean_seasonal_value = if (all(is.na(value))) NA_real_ else mean(value, na.rm = TRUE),
+            total_seasonal_value = if (all(is.na(value))) NA_real_ else sum(value, na.rm = TRUE))
+
+rm(pts_tc_may, pts_tc_may_long)
+gc()
+
+###################################################
+### work with june fires
+pts_tc_jun <- pts_tc %>%
+  filter(month == 6)
+
+### lag_0 = jun
+### lag_1 = may
+### lag_2 = apr
+### lag_3 = mar
+### lag_4 = fed
+### lag_5 = jan
+### lag_6 = dec
+### lag_7 = nov
+### lag_8 = oct
+### lag_9 = sep
+### lag_10 = aug
+### lag_11 = jul
+
+### make long
+pts_tc_jun_long <- pts_tc_jun %>%
+  pivot_longer(cols = -c(uid, ig_date, year, month),
+               names_to = "metric",
+               values_to = "value")
+
+### separate lag, add column for season
+pts_tc_jun_long <- pts_tc_jun_long %>%
+  separate(metric, into = c("metric_name", "lag", "lag_number"),  
+    sep = "_", extra = "merge", fill = "right") %>%
+  dplyr::select(-lag) %>%
+  mutate(season = ifelse(lag_number %in% c("1", "2", "3"), "spring",
+                         ifelse(lag_number %in% c("4", "5", "6"), "winter",
+                                ifelse(lag_number %in% c("7", "8", "9"), "fall",
+                                       ifelse(lag_number %in% c("10", "11"),
+                                              "summer", "misc")))))
+
+### get seasonal metrics
+pts_tc_jun_summ <- pts_tc_jun_long %>%
+  group_by(uid, ig_date, year, month, metric_name, season) %>%
+  summarise(max_seasonal_value = if (all(is.na(value))) NA_real_ else max(value, na.rm = TRUE),
+            mean_seasonal_value = if (all(is.na(value))) NA_real_ else mean(value, na.rm = TRUE),
+            total_seasonal_value = if (all(is.na(value))) NA_real_ else sum(value, na.rm = TRUE))
+
+rm(pts_tc_jun, pts_tc_jun_long)
+gc()
+
+##############################
+### work with dec fires
+pts_tc_dec <- pts_tc %>%
+  filter(month == 12)
+
+### lag_0 = dec
+### lag_1 = nov
+### lag_2 = oct
+### lag_3 = sep
+### lag_4 = aug
+### lag_5 = jul
+### lag_6 = jun
+### lag_7 = may
+### lag_8 = apr
+### lag_9 = mar
+### lag_10 = feb
+### lag_11 = jan
+
+### make long
+pts_tc_dec_long <- pts_tc_dec %>%
+  pivot_longer(cols = -c(uid, ig_date, year, month),
+               names_to = "metric",
+               values_to = "value")
+
+### separate lag, add column for season
+pts_tc_dec_long <- pts_tc_dec_long %>%
+  separate(metric, into = c("metric_name", "lag", "lag_number"),  
+    sep = "_", extra = "merge", fill = "right") %>%
+  dplyr::select(-lag) %>%
+  mutate(season = ifelse(lag_number == "0", "winter",
+                         ifelse(lag_number %in% c("1", "2", "3"), "fall",
+                                ifelse(lag_number %in% c("4", "5", "6"), "summer",
+                                       ifelse(lag_number %in% c("7", "8", "9"),
+                                              "spring", "misc")))))
+
+### lag_0 = dec
+### lag_1 = nov
+### lag_2 = oct
+### lag_3 = sep
+### lag_4 = aug
+### lag_5 = jul
+### lag_6 = jun
+### lag_7 = may
+### lag_8 = apr
+### lag_9 = mar
+### lag_10 = feb
+### lag_11 = jan
+
+### get seasonal metrics
+pts_tc_dec_summ <- pts_tc_dec_long %>%
+  group_by(uid, ig_date, year, month, metric_name, season) %>%
+  summarise(max_seasonal_value = if (all(is.na(value))) NA_real_ else max(value, na.rm = TRUE),
+            mean_seasonal_value = if (all(is.na(value))) NA_real_ else mean(value, na.rm = TRUE),
+            total_seasonal_value = if (all(is.na(value))) NA_real_ else sum(value, na.rm = TRUE))
+
+write_csv(pts_tc_dec_summ, "E:/fuel_treat/covars/terraclimate/tc_month/terraclimate_dec.csv")
+
+##############################
+### work with oct fires
+pts_tc_oct <- pts_tc %>%
+  filter(month == 10)
+
+### lag_0 = oct
+### lag_1 = sep
+### lag_2 = aug
+### lag_3 = jul
+### lag_4 = jun
+### lag_5 = may
+### lag_6 = apr
+### lag_7 = mar
+### lag_8 = feb
+### lag_9 = jan
+### lag_10 = dec
+### lag_11 = nov
+
+#### just do 2007
+pts_tc_oct_2007 <- pts_tc_oct %>%
+  filter(year == 2007)
+
+### make long
+pts_tc_oct_2007_long <- pts_tc_oct_2007 %>%
+  pivot_longer(cols = -c(uid, ig_date, year, month),
+               names_to = "metric",
+               values_to = "value")
+
+### separate lag, add column for season
+pts_tc_oct_2007_long <- pts_tc_oct_2007_long %>%
+  separate(metric, into = c("metric_name", "lag", "lag_number"),  
+           sep = "_", extra = "merge", fill = "right") %>%
+  dplyr::select(-lag) %>%
+  mutate(season = ifelse(lag_number == "0", "winter",
+                         ifelse(lag_number %in% c("1", "2", "3"), "fall",
+                                ifelse(lag_number %in% c("4", "5", "6"), "summer",
+                                       ifelse(lag_number %in% c("7", "8", "9"),
+                                              "spring", "misc")))))
+
+### get seasonal metrics
+pts_tc_oct_2007_summ <- pts_tc_oct_2007_long %>%
+  group_by(uid, ig_date, year, month, metric_name, season) %>%
+  summarise(max_seasonal_value = if (all(is.na(value))) NA_real_ else max(value, na.rm = TRUE),
+            mean_seasonal_value = if (all(is.na(value))) NA_real_ else mean(value, na.rm = TRUE),
+            total_seasonal_value = if (all(is.na(value))) NA_real_ else sum(value, na.rm = TRUE))
+
+write_csv(pts_tc_oct_2007_summ, "E:/fuel_treat/covars/terraclimate/tc_month/terraclimate_oct_2007.csv")
+```
+#### combine and fix units
+Units from TerraClimate in GEE:
+- pr: mm, no scale
+
+- soil: mm, scale = 0.1
+- tmmn: degrees C, scale = 0.1
+- tmmx: degrees C, scale = 0.1
+
+- vpd: kPA, scale = 0.01
+- vs: m/s, scale = 0.01
+- pdsi: no unit, scale = 0.01
+
+```{r}
+# ### list files
+# tc_files <- list.files(path = "E:/fuel_treat/covars/terraclimate/tc_month/",
+#                         pattern = ".csv$",
+#                         full.names = TRUE)
+# 
+# ### open them
+# tc_files <- lapply(tc_files, read.csv)
+# 
+# ### check 17
+# test <- tc_files[[17]]
+# 
+# ### fix weird value in 17
+# test$total_seasonal_value[test$total_seasonal_value == "-"] <- NA
+# write_csv(test, "E:/fuel_treat/covars/terraclimate/tc_month/terraclimate_jun_2007.csv")
+
+### list files
+tc_files <- list.files(path = "E:/fuel_treat/covars/terraclimate/tc_month/",
+                        pattern = ".csv$",
+                        full.names = TRUE)
+
+### open them
+tc_files <- lapply(tc_files, read.csv)
+
+### combine
+tc_files <- do.call("rbind", tc_files)
+
+### deal with scaling factors
+# - pr: mm, no scale
+# - soil: mm, scale = 0.1
+# - tmmn: degrees C, scale = 0.1
+# - tmmx: degrees C, scale = 0.1
+# - vpd: kPA, scale = 0.01
+# - vs: m/s, scale = 0.01
+# - pdsi: no unit, scale = 0.01
+tc_files <- tc_files %>%
+  mutate(max_seasonal_value = ifelse(metric_name %in% c("vs", "vpd", "pdsi"), 
+                                           max_seasonal_value*0.01, 
+                                           ifelse(metric_name %in% c("soil", "tmmx", "tmmn"),
+                                                  max_seasonal_value*0.1, 
+                                                  max_seasonal_value)),
+         mean_seasonal_value = ifelse(metric_name %in% c("vs", "vpd", "pdsi"), 
+                                           mean_seasonal_value*0.01, 
+                                           ifelse(metric_name %in% c("soil", "tmmx", "tmmn"),
+                                                  mean_seasonal_value*0.1, 
+                                                  mean_seasonal_value)),
+         total_seasonal_value = ifelse(metric_name %in% c("vs", "vpd", "pdsi"), 
+                                           total_seasonal_value*0.01, 
+                                           ifelse(metric_name %in% c("soil", "tmmx", "tmmn"),
+                                                  total_seasonal_value*0.1, 
+                                                  total_seasonal_value)))
+
+### get rid of season = misc
+tc_files <- tc_files %>%
+  filter(!season == "misc")
+
+### make wide
+tc_wide <- tc_files %>%
+  pivot_longer(cols = c(max_seasonal_value, mean_seasonal_value, total_seasonal_value),
+               names_to = "metric",
+               values_to = "value") %>%
+  unite("season_metric", season, metric_name, metric, sep = "_") %>%
+  pivot_wider(names_from = season_metric, values_from = value)
+
+### drop the cols I don't need
+tc_wide <- tc_wide %>%
+  dplyr::select(-`__total_seasonal_value`, -`__max_seasonal_value`, 
+                -`__mean_seasonal_value`, -`_pdsi_max_seasonal_value`, 
+                -`_pdsi_mean_seasonal_value`, -`_pdsi_total_seasonal_value`,
+                -fall_pdsi_total_seasonal_value, -winter_pdsi_total_seasonal_value,
+                -spring_pdsi_total_seasonal_value, -summer_pdsi_total_seasonal_value,
+                -fall_soil_total_seasonal_value, -winter_soil_total_seasonal_value,
+                -spring_soil_total_seasonal_value, -summer_soil_total_seasonal_value,
+                -fall_pr_max_seasonal_value, -winter_pr_max_seasonal_value,
+                -spring_pr_max_seasonal_value, -summer_pr_max_seasonal_value,
+                -fall_pr_mean_seasonal_value, -winter_pr_mean_seasonal_value,
+                -spring_pr_mean_seasonal_value, -summer_pr_mean_seasonal_value,
+                -fall_tmmn_total_seasonal_value, -winter_tmmn_total_seasonal_value,
+                -spring_tmmn_total_seasonal_value, -summer_tmmn_total_seasonal_value,
+                -fall_tmmx_total_seasonal_value, -winter_tmmx_total_seasonal_value,
+                -spring_tmmx_total_seasonal_value, -summer_tmmx_total_seasonal_value,
+                -fall_vs_total_seasonal_value, -winter_vs_total_seasonal_value,
+                -spring_vs_total_seasonal_value, -summer_vs_total_seasonal_value,
+                -fall_vpd_total_seasonal_value, -winter_vpd_total_seasonal_value,
+                -spring_vpd_total_seasonal_value, -summer_vpd_total_seasonal_value)
+
+### write out
+write_csv(tc_wide, "E:/fuel_treat/covars/terraclim_summs.csv")
+```
+
+Note on units:
+Values are extracted directly from the Earth Engine assets and are not transformed to be in comparable units across data sources. 
+Given that the units are different, these will need to be transformed before use/comparison. For example, terraclimate has temperatures
+in units of 0.1 degrees C (e.g., a value of 254 is 25.4C), while gridmet has temps in deg K.
+
+Links to info on band units
+- https://developers.google.com/earth-engine/datasets/catalog/IDAHO_EPSCOR_TERRACLIMATE#bands
+
+
 
 ## VIIRS
 From viirs_code.Rmd
@@ -7261,72 +8594,6 @@ ggplot() +
   ylab("Number of treatments") +
   theme_bw()
 ```
-
-## Distance to boundaries
-```{r}
-### open inner lines
-lines_fires <- st_read("E:/fuel_treat/esa_subset/ft_boundaries/inner_lines.shp")
-
-### open sample points
-pts <- st_read("E:/fuel_treat/esa_subset/esa_sample_pts_simp.shp")
-
-### remove fire CA3320411691620031026 (2003) because it burned over ft previously burned in CA3314611689619930509 (1993)
-pts <- pts %>%
-  filter(!fire_id == "CA3320411691620031026")
-
-### drop associated inner line
-lines_fires <- lines_fires %>%
-  filter(!Event_ID == "CA3320411691620031026")
-
-### set up parallels
-options(future.globals.maxSize = 2 * 1024^3)
-plan(multisession)
-
-### function to get dist for each pt
-get_dist_df <- function(i) {
-  
-  ### get pt
-  pt_i <- pts[i, ]
-  
-  ### get line
-  line_i <- lines_fires %>%
-    filter(Event_ID %in% pt_i$fire_id)
-  
-  ### deal with NAs
-  if (nrow(line_i) == 0) {
-    return(data.frame(uid = pt_i$uid, 
-                      dist_bound = NA_real_))
-  }
-  
-  ### calculate distance
-  dist_i <- st_distance(pt_i, line_i)
-  
-  ### make df
-  df_i <- data.frame(uid = pt_i$uid,
-                     dist_bound = as.numeric(dist_i))
-  
-  ### return df
-  return(df_i)
-}
-
-### run in parallel
-dist_list <- future_map(1:nrow(pts), 
-                        get_dist_df,
-                        .progress = TRUE,
-                        .options = furrr_options(seed = TRUE))
-
-dist_df <- do.call(rbind, dist_list)
-
-### combine with pt attributes
-pt_att <- pts %>%
-  dplyr::select(uid, fire_id)
-st_geometry(pt_att) <- NULL
-dist_df <- merge(x = dist_df,
-                 y = pt_att,
-                 by = "uid",
-                 all = TRUE)
-```
-
 ## 2. Next batch of fires and fuel treatments
 Use fires I've already downloaded CBI
 ```{r}
