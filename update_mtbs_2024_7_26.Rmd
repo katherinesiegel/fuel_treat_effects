@@ -19,7 +19,13 @@ date: "2025-07-04"
 ## Steps
 Once GEE finishes processing fire polygons, will need to re-run chunks "make sure all firedpy fires ran in GEE" and "make sure all mtbs fires ran in GEE" to capture any fires that are still missing. As of 7/23 morning, GEE still processing some of the fire CBIs
 
-After ESA: re-do categorization of activities to take both activity and equipment into account (Drip torch, etc)
+## After ESA
+Things to do after ESA:
+- re-do categorization of activities to take both activity and equipment into account (Drip torch, etc)
+- use all fires/fuel treatments
+- fix EVI
+- get climate normals
+- fire weather
 
 
 ## Set up
@@ -45,6 +51,7 @@ library(data.table)
 ```
 
 Code adapted from west_us.Rmd
+## Fire perimeters
 ### MTBS fire perimeters 
 ```{r}
 ### open all fires
@@ -8375,6 +8382,12 @@ st_write(fires_eco, "E:/fuel_treat/epa_ecoregions/fires_ecoreg.shp")
 ```
 
 ## Combine covariates
+- ecoregion
+- tpi and dem
+- ndvi, ndmi, evi
+- boundary points (boundary of fire/ft and fire boundary)
+- distance to boundary
+- climate
 ```{r}
 ### open ecoreg
 ecoreg <- read.csv("E:/fuel_treat/covars/ecoregion.csv")
@@ -8422,6 +8435,93 @@ ecoreg <- merge(x = ecoreg,
 ### write out
 write_csv(ecoreg,
           "E:/fuel_treat/covars/esa_covars.csv")
+
+### open ndmi, ndvi, evi
+ndvi <- read.csv("E:/fuel_treat/covars/ndvi.csv") %>%
+  dplyr::select(., uid, ndvi)
+ndmi <- read.csv("E:/fuel_treat/covars/ndmi.csv") %>%
+  dplyr::select(., uid, ndmi)
+evi <- read.csv("E:/fuel_treat/covars/evi.csv") %>%
+  dplyr::select(., uid, evi)
+
+### drop dups from evi
+evi <- evi %>% distinct()
+
+### merge them
+veg_indices <- ndvi %>%
+  left_join(ndmi, by = "uid") %>%
+  left_join(evi, by = "uid")
+  
+### merge with other covars
+covars <- ecoreg %>%
+  left_join(veg_indices, by = "uid")
+  
+### clean up
+rm(ecoreg, evi, ndmi, ndvi, veg_indices)
+gc()
+
+### open boundary status
+pt_status <- st_read("E:/fuel_treat/esa_subset/pt_status.shp")
+
+### clean up
+st_geometry(pt_status) <- NULL
+pt_status <- pt_status %>%
+  dplyr::select(uid,
+                in_fire,
+                overlap_bound = ovrlp_b)
+# pt_status <- pt_status %>% distinct()
+
+### combine
+covars <- covars %>%
+  left_join(pt_status, by = "uid")
+
+### clean up
+rm(pt_status)
+gc()
+
+### open distance to boundary
+dist_all <- read.csv("E:/fuel_treat/covars/pts_dist_min_fix_full.csv")
+
+### combine
+covars <- covars %>%
+  left_join(dist_all, by = "uid")
+
+### clean up
+rm(dist_all)
+gc()
+
+### open climate data
+clim <- read.csv("E:/fuel_treat/covars/terraclim_summs.csv")
+
+### simplify clim
+clim <- clim %>% 
+  dplyr::select(-ig_date, -year, -month)
+
+### drop uids in clim that aren't in covars
+clim <- clim %>%
+  filter(uid %in% covars$uid)
+clim <- distinct(clim)
+
+### duplicate uids in clim?
+dup_uids <- duplicated(clim$uid) | duplicated(clim$uid, 
+                                              fromLast = TRUE)
+
+### the dup uid's are happening where one row with the uid has data and the other row just has NA values for the climate data
+### get climate cols
+non_uid_cols <- setdiff(names(clim), "uid")
+
+### figure out which ones have only NA vals
+all_na <- rowSums(is.na(clim[non_uid_cols])) == length(non_uid_cols)
+
+### drop rows with duplicated uids AND all NA values for climate
+clim_summ <- clim[!(dup_uids & all_na), ]
+
+### combine
+covars <- covars %>%
+  left_join(clim_summ, by = "uid")
+
+### write out
+write_csv(covars, "E:/fuel_treat/covars/esa_covars_all.csv")
 ```
 
 ## Extract ft info
@@ -8565,35 +8665,95 @@ esa_ft_simp_pts <- esa_ft_simp_pts %>%
 pts_activities <- merge(x = esa_ft_simp_pts,
                         y = categories, 
                         # by = "act_code",
-                        by = "join_id",
+                        by = c("join_id", "fire_id",
+                               "poly_id", "state",
+                               "act_code"),
                         all.x = TRUE)
 
-### drop nas
+### deal with activity code 1113
 pts_activities <- pts_activities %>%
-  filter(!is.na(treat_status))
-
-pts_activities <- pts_activities %>%
-  mutate(activity_cat = ifelse(act_code.x == "1113",
+  mutate(activity_cat = ifelse(act_code == "1113",
                                "fire_ft",
                                activity_cat))
 
-### NAs
-na_activity <- pts_activities %>%
-  filter(is.na(activity_cat))
+### write out
+write_csv(pts_activities,
+          "E:/fuel_treat/covars/esa_ft_info.csv")
 
-### drop NAs
-pts_activities <- pts_activities %>%
-  filter(!is.na(activity_cat))
 
-ggplot() +
-  geom_histogram(data = pts_activities, 
-                 aes(x = yrs_elapse,
-                     color = activity_cat,
-                     fill = activity_cat)) +
-  xlab("Years from treatment to wildfire") +
-  ylab("Number of treatments") +
-  theme_bw()
+# ### drop nas
+# pts_activities <- pts_activities %>%
+#   filter(!is.na(treat_status))
+# 
+# pts_activities <- pts_activities %>%
+#   mutate(activity_cat = ifelse(act_code.x == "1113",
+#                                "fire_ft",
+#                                activity_cat))
+# 
+# ### NAs
+# na_activity <- pts_activities %>%
+#   filter(is.na(activity_cat))
+# 
+# ### drop NAs
+# pts_activities <- pts_activities %>%
+#   filter(!is.na(activity_cat))
+# 
+# ggplot() +
+#   geom_histogram(data = pts_activities, 
+#                  aes(x = yrs_elapse,
+#                      color = activity_cat,
+#                      fill = activity_cat)) +
+#   xlab("Years from treatment to wildfire") +
+#   ylab("Number of treatments") +
+#   theme_bw()
 ```
+
+## Add ft info to covars
+```{r}
+### open covars
+covars <- read.csv("E:/fuel_treat/covars/esa_covars_all.csv")
+
+### open fuel treat info
+ft_info <- read.csv("E:/fuel_treat/covars/esa_ft_info.csv")
+
+### combine them
+ft_covars <- merge(x = covars,
+                   y = ft_info,
+                   by = c("uid", "fire_id", "fire_year"),
+                   all = TRUE)
+
+### distinct
+ft_covars <- distinct(ft_covars)
+
+### are there uid's repeated?
+check_uid <- ft_covars %>%
+  group_by(uid) %>%
+  summarise(n_occur = n()) %>%
+  filter(n_occur > 1)
+
+### take a look at these
+check_uid <- ft_covars %>%
+  filter(uid %in% check_uid$uid)
+
+### take a look at one of them
+check_2 <- ft_covars %>%
+  filter(uid == "CA3761912020720170716_177970")
+
+### why are these different?
+all.equal(check_2[1, ], check_2[2, ])
+all.equal(check_2[1, ], check_2[3, ])
+
+### the issue is treatments at different times. ugh.
+
+### write it out as it is, just to have it all in one place
+write_csv(ft_covars, "E:/fuel_treat/covars/esa_covars_fts_all.csv")
+```
+
+## RDD
+
+
+
+
 ## 2. Next batch of fires and fuel treatments
 Use fires I've already downloaded CBI
 ```{r}
